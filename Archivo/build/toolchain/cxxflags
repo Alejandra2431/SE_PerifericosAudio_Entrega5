@@ -1,0 +1,6 @@
+-mlongcalls
+-fno-builtin-memcpy
+-fno-builtin-memset
+-fno-builtin-bzero
+"-specs=C:/Users/aleja/ucu/2026/IoTySE/Entrega5/Archivo/build/specs/picolibc.specs"
+-fno-rtti

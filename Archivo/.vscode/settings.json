@@ -1,0 +1,17 @@
+{
+    "idf.currentSetup": "C:\\esp\\v6.0.2\\esp-idf",
+    "idf.flashType": "UART",
+    "idf.port": "COM9",
+    "idf.openOcdConfigs": [
+        "board/esp32s2-kaluga-1.cfg"
+    ],
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s2"
+    },
+    "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=c:\\Users\\aleja\\ucu\\2026\\IoTySE\\Entrega5\\Archivo\\build"
+    ]
+}

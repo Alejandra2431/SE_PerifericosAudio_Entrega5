@@ -105,6 +105,10 @@
 #define CANALES                 2             /* ranuras I2S; el ES8311 es mono */
 #define BLOQUE_BYTES            (BLOQUE_TRAMAS * CANALES * (int)sizeof(int16_t))
 
+#define GRABACION_SEGUNDOS       10
+#define GRABACION_MUESTRAS       (FRECUENCIA_HZ * GRABACION_SEGUNDOS)
+#define GRABACION_BYTES          (GRABACION_MUESTRAS * sizeof(int16_t))
+
 #define GANANCIA_MIN_DB         0
 #define GANANCIA_MAX_DB         36
 #define GANANCIA_PASO_DB        6
@@ -116,16 +120,19 @@
 
 /* --- Prioridades: por PLAZO, no por importancia (rate-monotonic) ---------
  *
- *   tactil    responde a un dedo:   ~100 ms y se nota
- *   captura   plazo DURO de 32 ms:  si llega tarde, el DMA pisa el bloque
+ *   captura   bloque de 32 ms: plazo más exigente, el DMA no espera
+ *   tactil    respuesta humana ~100 ms; el trabajo por pulsación es breve
  *   proceso   el plazo de captura
+ *   grabacion mantiene el ritmo promedio del audio, dispone de buffers para absorber demoras breves,
+ *  pero no debe retrasar captura
  *   interfaz  refresco visual:      si se retrasa 100 ms, nadie lo ve
  *
  * `captura` va por debajo de `tactil` a propósito: la tarea del táctil hace
  * cuatro cosas y se bloquea; nunca puede robarle 32 ms a nadie. */
-#define PRIO_TACTIL             9
-#define PRIO_CAPTURA            8
+#define PRIO_CAPTURA             9
+#define PRIO_TACTIL            8
 #define PRIO_PROCESO            6
+#define PRIO_GRABACION          5
 #define PRIO_INTERFAZ           3
 
 #define PILA_TACTIL             4096          /* habla con el códec por I2C */
@@ -251,6 +258,12 @@ typedef enum {
     AUDIO_REPRODUCIENDO
 } estado_audio_t;
 
+typedef enum {
+    AUDIO_EVT_SOLICITAR_GRABACION,
+    AUDIO_EVT_GRABACION_FINALIZADA,
+    AUDIO_EVT_REPRODUCCION_FINALIZADA
+} evento_audio_t;
+
 static const char *NOMBRE_ESTADO_AUDIO[] = {
     "LISTO",
     "GRABANDO",
@@ -280,6 +293,10 @@ static SemaphoreHandle_t s_mutex_estado;
 static TimerHandle_t     s_timer_informe;
 static TaskHandle_t      s_tarea_interfaz;
 
+static QueueHandle_t s_cola_control_audio;
+static TaskHandle_t s_tarea_control_audio;
+static TaskHandle_t s_tarea_reproduccion;
+
 static estado_t s_estado = {
     .db_q8 = DB_SUELO_Q8,
     .pico_db_q8 = DB_SUELO_Q8,
@@ -292,6 +309,11 @@ static i2s_chan_handle_t      s_i2s_tx;       /* en marcha y en silencio: App 5 
 static esp_codec_dev_handle_t s_codec;
 static led_strip_handle_t     s_led;
 static touch_sensor_handle_t  s_touch;
+
+/* Buffer de audio mono: 10 s, 16 kHz, 16 bits, reservado en PSRAM. */
+static int16_t *s_buffer_grabacion;
+static size_t s_muestras_grabadas;
+static bool s_solicitar_grabacion;
 
 /* Diagnóstico. Cada contador lo escribe una sola tarea. */
 static uint32_t s_medida_max_us;     /* peor caso de medir un bloque        */
@@ -424,7 +446,7 @@ static void configurar_codec(void)
         .gpio_if = gpio,
         /* Solo ADC: hoy nada más se graba. La App 5 lo cambia a
          * ESP_CODEC_DEV_WORK_MODE_BOTH para poder reproducir. */
-        .codec_mode = ESP_CODEC_DEV_WORK_MODE_ADC,
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
         .master_mode = false,        /* manda el ESP32-S2, obedece el códec */
         .use_mclk = true,
         .pa_pin = PA_ENABLE,
@@ -439,7 +461,7 @@ static void configurar_codec(void)
     ESP_ERROR_CHECK(es8311 != NULL ? ESP_OK : ESP_ERR_NOT_FOUND);
 
     esp_codec_dev_cfg_t dev = {
-        .dev_type = ESP_CODEC_DEV_TYPE_IN,
+        .dev_type = ESP_CODEC_DEV_TYPE_IN_OUT,
         .codec_if = es8311,
         .data_if = datos,
     };
@@ -496,6 +518,11 @@ static void tarea_captura(void *arg)
     int16_t *bloque = heap_caps_malloc(BLOQUE_BYTES, MALLOC_CAP_DEFAULT);
     ESP_ERROR_CHECK(bloque != NULL ? ESP_OK : ESP_ERR_NO_MEM);
 
+    bool grabando;
+    size_t muestras_restantes;
+
+    bool grabacion_completada = false;
+
     ESP_LOGI(TAG, "[captura] %d tramas por bloque = %d ms a %d Hz",
              BLOQUE_TRAMAS, (BLOQUE_TRAMAS * 1000) / FRECUENCIA_HZ, FRECUENCIA_HZ);
 
@@ -509,6 +536,51 @@ static void tarea_captura(void *arg)
         const int tramas = (int)(leidos / (CANALES * sizeof(int16_t)));
         if (tramas < BLOQUE_TRAMAS) {
             s_lecturas_cortas++;
+        }
+
+        /* Guardar muestras mono en PSRAM mientras se graba. */
+        bool avisar_fin = false;
+
+        xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+
+        grabando = (s_estado.audio == AUDIO_GRABANDO);
+
+        if (grabando && !grabacion_completada && tramas > 0) {
+            muestras_restantes =
+                GRABACION_MUESTRAS - s_muestras_grabadas;
+
+            size_t a_copiar = (size_t)tramas;
+            if (a_copiar > muestras_restantes) {
+                a_copiar = muestras_restantes;
+            }
+
+            for (size_t i = 0; i < a_copiar; i++) {
+                s_buffer_grabacion[s_muestras_grabadas + i] =
+                    bloque[i * CANALES];
+            }
+
+            s_muestras_grabadas += a_copiar;
+
+            if (s_muestras_grabadas >= GRABACION_MUESTRAS) {
+                grabacion_completada = true;
+                avisar_fin = true;
+            }
+        }
+
+        if (!grabando) {
+            grabacion_completada = false;
+        }
+
+        xSemaphoreGive(s_mutex_estado);
+
+        if (avisar_fin) {
+            evento_audio_t fin = AUDIO_EVT_GRABACION_FINALIZADA;
+
+            if (xQueueSend(s_cola_control_audio, &fin, 0) != pdTRUE) {
+                grabacion_completada = false;
+                ESP_LOGW(TAG,
+                         "[captura] no se pudo avisar fin de grabacion; se reintentara");
+            }
         }
 
         /* El ES8311 es MONO: su único convertidor sale en la ranura izquierda
@@ -665,6 +737,15 @@ static void tarea_tactil(void *arg)
         } else if (ev.canal == BOTONES[3].canal) {             /* RECORD */
             s_estado.pico_db_q8 = DB_SUELO_Q8;
             s_estado.recortes = 0;
+
+            if (s_estado.audio == AUDIO_LISTO) {
+                evento_audio_t solicitud =
+                    AUDIO_EVT_SOLICITAR_GRABACION;
+
+                if (xQueueSend(s_cola_control_audio, &solicitud, 0) != pdTRUE) {
+                    ESP_LOGW(TAG, "[audio] no se pudo enviar solicitud de grabacion");
+                }
+            }
         }
         const estado_t e = s_estado;
         xSemaphoreGive(s_mutex_estado);
@@ -902,6 +983,110 @@ static void tarea_interfaz(void *arg)
     }
 }
 
+static void tarea_control_audio(void *arg)
+{
+    evento_audio_t ev;
+
+    while (xQueueReceive(s_cola_control_audio, &ev, portMAX_DELAY) == pdTRUE) {
+        bool iniciar_reproduccion = false;
+
+        xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+
+        switch (ev) {
+        case AUDIO_EVT_SOLICITAR_GRABACION:
+            if (s_estado.audio == AUDIO_LISTO) {
+                s_muestras_grabadas = 0;
+                s_estado.audio = AUDIO_GRABANDO;
+                ESP_LOGI(TAG, "[audio] comienza grabacion");
+            }
+            break;
+
+        case AUDIO_EVT_GRABACION_FINALIZADA:
+            if (s_estado.audio == AUDIO_GRABANDO &&
+                s_muestras_grabadas >= GRABACION_MUESTRAS) {
+                s_estado.audio = AUDIO_REPRODUCIENDO;
+                iniciar_reproduccion = true;
+                ESP_LOGI(TAG, "[audio] grabacion completa; comienza reproduccion");
+            }
+            break;
+
+        case AUDIO_EVT_REPRODUCCION_FINALIZADA:
+            if (s_estado.audio == AUDIO_REPRODUCIENDO) {
+                s_estado.audio = AUDIO_LISTO;
+                ESP_LOGI(TAG, "[audio] reproduccion finalizada");
+            }
+            break;
+        }
+
+        xSemaphoreGive(s_mutex_estado);
+
+        if (iniciar_reproduccion) {
+            xTaskNotifyGive(s_tarea_reproduccion);
+        }
+    }
+}
+
+
+static void tarea_reproduccion(void *arg)
+{
+    /* El TX necesita bloques estéreo en memoria interna apta para DMA. */
+    int16_t *estereo = heap_caps_malloc(
+        BLOQUE_BYTES,
+        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
+    );
+    ESP_ERROR_CHECK(estereo != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+
+    while (1) {
+        /* Esperar hasta que la controladora habilite la reproducción. */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        size_t offset = 0;
+        bool correcta = true;
+
+        while (offset < GRABACION_MUESTRAS) {
+            size_t tramas = GRABACION_MUESTRAS - offset;
+
+            if (tramas > BLOQUE_TRAMAS) {
+                tramas = BLOQUE_TRAMAS;
+            }
+
+            /* Expandir mono a estéreo: misma muestra en L y R. */
+            for (size_t i = 0; i < tramas; i++) {
+                int16_t muestra = s_buffer_grabacion[offset + i];
+                estereo[2 * i]     = muestra;
+                estereo[2 * i + 1] = muestra;
+            }
+
+            size_t bytes = tramas * CANALES * sizeof(int16_t);
+            size_t escritos = 0;
+
+            esp_err_t err = i2s_channel_write(
+                s_i2s_tx, estereo, bytes, &escritos, 1000
+            );
+
+            if (err != ESP_OK || escritos != bytes) {
+                ESP_LOGE(TAG,
+                         "[reproduccion] error TX: err=%s, escritos=%u/%u",
+                         esp_err_to_name(err),
+                         (unsigned)escritos, (unsigned)bytes);
+                correcta = false;
+                break;
+            }
+
+            offset += tramas;
+        }
+
+        if (correcta) {
+            ESP_LOGI(TAG, "[reproduccion] audio enviado completamente");
+        } else {
+            ESP_LOGW(TAG, "[reproduccion] reproduccion interrumpida");
+        }
+
+        evento_audio_t fin = AUDIO_EVT_REPRODUCCION_FINALIZADA;
+        xQueueSend(s_cola_control_audio, &fin, portMAX_DELAY);
+    }
+}
+
 /* ======================================================================== */
 /*  Informe periódico                                                        */
 /* ======================================================================== */
@@ -1037,7 +1222,7 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "=== audio_vu: microfono, codec ES8311 y VU-metro ===");
     ESP_LOGI(TAG, "PLAY = balistica VU/PPM/CRUDO | VOL_UP y VOL_DOWN = ganancia | "
-                  "RECORD = reinicia pico");
+              "RECORD = grabar 10 s y reproducir");
 
     COLOR_FONDO = pantalla_color(10, 16, 30);
     COLOR_TINTA = pantalla_color(230, 236, 245);
@@ -1061,12 +1246,29 @@ void app_main(void)
     s_cola_niveles = xQueueCreate(COLA_NIVELES_LARGO, sizeof(nivel_t));
     s_cola_toques  = xQueueCreate(COLA_TOQUES_LARGO, sizeof(toque_t));
     s_mutex_estado = xSemaphoreCreateMutex();
-    ESP_ERROR_CHECK((s_cola_niveles && s_cola_toques && s_mutex_estado)
+
+    s_cola_control_audio = xQueueCreate(4, sizeof(evento_audio_t));
+    
+    ESP_ERROR_CHECK((s_cola_niveles && s_cola_toques && s_cola_control_audio && s_mutex_estado)
                         ? ESP_OK : ESP_ERR_NO_MEM);
 
     configurar_i2s();
     configurar_codec();
     configurar_tactil();
+
+    s_buffer_grabacion = heap_caps_malloc(
+        GRABACION_BYTES,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+    );
+
+    ESP_ERROR_CHECK(
+        s_buffer_grabacion != NULL ? ESP_OK : ESP_ERR_NO_MEM
+    );
+
+    s_muestras_grabadas = 0;
+
+    ESP_LOGI(TAG, "Buffer de grabacion: %u bytes en PSRAM",
+         (unsigned)GRABACION_BYTES);
 
     ESP_LOGI(TAG, "codec listo: %d Hz, 16 bits, ganancia de entrada %d dB",
              FRECUENCIA_HZ, GANANCIA_INICIAL_DB);
@@ -1081,6 +1283,10 @@ void app_main(void)
      * aquí no lo hay, y lo pone la secuencia de xTaskCreate(). */
     xTaskCreate(tarea_interfaz, "interfaz", PILA_INTERFAZ, NULL, PRIO_INTERFAZ,
                 &s_tarea_interfaz);
+    xTaskCreate(tarea_reproduccion, "reproduccion",
+                4096, NULL, PRIO_GRABACION, &s_tarea_reproduccion);
+    xTaskCreate(tarea_control_audio, "control_audio",
+                3072, NULL, PRIO_GRABACION, &s_tarea_control_audio);
     xTaskCreate(tarea_tactil,   "tactil",   PILA_TACTIL,   NULL, PRIO_TACTIL,   NULL);
     xTaskCreate(tarea_captura,  "captura",  PILA_CAPTURA,  NULL, PRIO_CAPTURA,  NULL);
     xTaskCreate(tarea_proceso,  "proceso",  PILA_PROCESO,  NULL, PRIO_PROCESO,  NULL);

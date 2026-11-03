@@ -1,0 +1,5 @@
+# Archivos generados por la compilación
+/build/
+
+# Archivos de configuración locales o temporales
+sdkconfig.old

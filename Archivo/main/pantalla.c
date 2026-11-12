@@ -161,13 +161,20 @@ static bool IRAM_ATTR al_terminar_envio(esp_lcd_panel_io_handle_t io,
  * CPU es de las demás. Es el patrón ISR -> semáforo -> tarea de la Clase 4. */
 static void enviar(int x0, int y0, int x1, int y1)
 {
-    xSemaphoreTake(s_sem_enviado, 0);           /* por si quedó dado de antes */
-    if (esp_lcd_panel_draw_bitmap(s_panel, x0, y0, x1, y1, s_buf) != ESP_OK) {
+    xSemaphoreTake(s_sem_enviado, 0);
+
+    esp_err_t err = esp_lcd_panel_draw_bitmap(
+        s_panel, x0, y0, x1, y1, s_buf
+    );
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error enviando dibujo: %s", esp_err_to_name(err));
         return;
     }
-    /* El plazo es solo una red de seguridad: los 10 KB de la banda más grande
-     * tardan 2 ms a 40 MHz. */
-    xSemaphoreTake(s_sem_enviado, pdMS_TO_TICKS(100));
+
+    if (xSemaphoreTake(s_sem_enviado, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGE(TAG, "Timeout esperando fin de transferencia SPI");
+    }
 }
 
 /* ------------------------------------------------------------- arranque -- */
@@ -214,12 +221,12 @@ bool pantalla_iniciar(void)
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
     };
-#if PANTALLA == 1
-    if (esp_lcd_new_panel_st7789(io, &panel_cfg, &s_panel) != ESP_OK) {
-#else
-    if (esp_lcd_new_panel_ili9341(io, &panel_cfg, &s_panel) != ESP_OK) {
-#endif
-        ESP_LOGE(TAG, "no se pudo crear el panel");
+    #if PANTALLA == 1
+        if (esp_lcd_new_panel_st7789(io, &panel_cfg, &s_panel) != ESP_OK) {
+        #else
+            if (esp_lcd_new_panel_ili9341(io, &panel_cfg, &s_panel) != ESP_OK) {
+        #endif
+            ESP_LOGE(TAG, "no se pudo crear el panel");
         return false;
     }
 
@@ -251,15 +258,15 @@ bool pantalla_iniciar(void)
         return false;
     }
 
-#if LCD_BK >= 0
-    /* La retroiluminación, lo último: en BAJO enciende (ver la cabecera). */
-    const gpio_config_t bk = {
-        .pin_bit_mask = 1ULL << LCD_BK,
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    ESP_ERROR_CHECK(gpio_config(&bk));
-    ESP_ERROR_CHECK(gpio_set_level(LCD_BK, 0));
-#endif
+    #if LCD_BK >= 0
+        /* La retroiluminación, lo último: en BAJO enciende (ver la cabecera). */
+        const gpio_config_t bk = {
+            .pin_bit_mask = 1ULL << LCD_BK,
+            .mode = GPIO_MODE_OUTPUT,
+        };
+        ESP_ERROR_CHECK(gpio_config(&bk));
+        ESP_ERROR_CHECK(gpio_set_level(LCD_BK, 0));
+    #endif
 
     ESP_LOGI(TAG, "panel %s listo, %dx%d, SPI2 a %d MHz",
              pantalla_controlador(), PANTALLA_ANCHO, PANTALLA_ALTO,
@@ -306,6 +313,10 @@ void pantalla_rect(int x, int y, int ancho, int alto, uint16_t color)
 
     for (int fila = 0; fila < alto; fila += filas) {
         const int n = (alto - fila < filas) ? (alto - fila) : filas;
+
+        ESP_LOGI(TAG, "Enviando dibujo: x=%d y=%d ancho=%d alto=%d",
+             x, y + fila, ancho, n);
+
         enviar(x, y + fila, x + ancho, y + fila + n);
     }
 }

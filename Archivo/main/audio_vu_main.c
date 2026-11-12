@@ -309,6 +309,7 @@ static i2s_chan_handle_t      s_i2s_tx;       /* en marcha y en silencio: App 5 
 static esp_codec_dev_handle_t s_codec;
 static led_strip_handle_t     s_led;
 static touch_sensor_handle_t  s_touch;
+static int16_t *s_buffer_grabacion = NULL;
 
 /* Buffer de audio mono: 10 s, 16 kHz, 16 bits, reservado en PSRAM. */
 static int16_t *s_buffer_grabacion;
@@ -482,6 +483,10 @@ static void configurar_codec(void)
     };
     ESP_ERROR_CHECK(esp_codec_dev_open(s_codec, &muestreo)
                         == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL);
+
+    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(s_codec, 60)
+                    == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL);
+
     ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(s_codec, (float)GANANCIA_INICIAL_DB)
                         == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL);
 }
@@ -1247,25 +1252,28 @@ void app_main(void)
     s_cola_toques  = xQueueCreate(COLA_TOQUES_LARGO, sizeof(toque_t));
     s_mutex_estado = xSemaphoreCreateMutex();
 
+
     s_cola_control_audio = xQueueCreate(4, sizeof(evento_audio_t));
     
     ESP_ERROR_CHECK((s_cola_niveles && s_cola_toques && s_cola_control_audio && s_mutex_estado)
                         ? ESP_OK : ESP_ERR_NO_MEM);
 
+    s_buffer_grabacion = heap_caps_malloc(
+    GRABACION_BYTES,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+    );
+
+    ESP_ERROR_CHECK(s_buffer_grabacion != NULL ? ESP_OK : ESP_ERR_NO_MEM); 
+
+    s_muestras_grabadas = 0;
+
+    ESP_LOGI(TAG, "Memoria reservada para grabacion: %d bytes",
+         GRABACION_BYTES);
+
     configurar_i2s();
     configurar_codec();
     configurar_tactil();
 
-    s_buffer_grabacion = heap_caps_malloc(
-        GRABACION_BYTES,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
-    );
-
-    ESP_ERROR_CHECK(
-        s_buffer_grabacion != NULL ? ESP_OK : ESP_ERR_NO_MEM
-    );
-
-    s_muestras_grabadas = 0;
 
     ESP_LOGI(TAG, "Buffer de grabacion: %u bytes en PSRAM",
          (unsigned)GRABACION_BYTES);

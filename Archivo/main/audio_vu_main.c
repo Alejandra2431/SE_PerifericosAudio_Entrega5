@@ -312,7 +312,6 @@ static touch_sensor_handle_t  s_touch;
 static int16_t *s_buffer_grabacion = NULL;
 
 /* Buffer de audio mono: 10 s, 16 kHz, 16 bits, reservado en PSRAM. */
-static int16_t *s_buffer_grabacion;
 static size_t s_muestras_grabadas;
 static bool s_solicitar_grabacion;
 
@@ -403,6 +402,21 @@ static void configurar_i2s(void)
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_tx, &std));   /* maestro */
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_rx, &std));
+
+    /*
+    * DECISION DE DISEÑO: coexistencia de grabacion y reproduccion.
+    *
+    * Se mantienen habilitados simultaneamente los canales RX y TX
+    * de I2S, utilizando el mismo periferico y el mismo codec ES8311.
+    *
+    * RX se utiliza para capturar el audio del microfono y TX para
+    * reproducir las muestras almacenadas en PSRAM.
+    *  
+    * Durante la reproduccion, RX continua funcionando para mantener
+    actualizado el medidor de nivel, pero las muestras no se guardan
+    * en el buffer de grabacion. De esta forma se evita sobrescribir
+    * el audio que se esta reproduciendo.
+    */
     ESP_ERROR_CHECK(i2s_channel_enable(s_i2s_tx));
     ESP_ERROR_CHECK(i2s_channel_enable(s_i2s_rx));
 }
@@ -445,8 +459,12 @@ static void configurar_codec(void)
     es8311_codec_cfg_t es_cfg = {
         .ctrl_if = ctrl,
         .gpio_if = gpio,
-        /* Solo ADC: hoy nada más se graba. La App 5 lo cambia a
-         * ESP_CODEC_DEV_WORK_MODE_BOTH para poder reproducir. */
+    /*
+        * El codec ES8311 se configura en modo BOTH para habilitar
+        * simultaneamente la captura de audio (ADC) y la reproduccion (DAC).
+        * La entrada se utiliza para grabar desde el microfono y la salida
+        * para reproducir las muestras almacenadas en PSRAM.
+    */
         .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
         .master_mode = false,        /* manda el ESP32-S2, obedece el códec */
         .use_mclk = true,
@@ -550,6 +568,14 @@ static void tarea_captura(void *arg)
 
         grabando = (s_estado.audio == AUDIO_GRABANDO);
 
+        /*
+         * Durante GRABANDO, las muestras recibidas por RX se almacenan
+         * en PSRAM.
+         *
+         * Durante REPRODUCIENDO, RX sigue leyendo el microfono para
+         * actualizar el medidor, pero no modifica el buffer de grabacion,
+         * que contiene las muestras que utiliza la tarea de reproduccion.
+         */
         if (grabando && !grabacion_completada && tramas > 0) {
             muestras_restantes =
                 GRABACION_MUESTRAS - s_muestras_grabadas;

@@ -5,11 +5,11 @@
  * ES8311, viaja por I2S con DMA hasta la SRAM y se convierte en un nivel en
  * decibelios que se pinta en la TFT, en el LED RGB y en la consola.
  *
- *   micro ──▶ ES8311 ──I2S/DMA──▶ [captura p8] ──cola──▶ [proceso p6] ──┐
+ *   micro ──▶ ES8311 ──I2S/DMA──▶ [captura p9] ──cola──▶ [proceso p6] ──┐
  *              (I2C: control)      RMS, pico,          balística         │ mutex
  *                                  recortes           VU / PPM           ▼
  *                                                                 ┌────────────┐
- *   [tactil p9] ──notificación────────────────────────────────────▶│  estado    │
+ *   [tactil p7] ──cola de control─────────────────────────────────▶│  estado    │
  *    cola de la ISR del táctil                                     │ compartido │
  *                                                                 └────────────┘
  *                                                                        │ mutex
@@ -104,6 +104,10 @@
 #define BLOQUE_TRAMAS           512
 #define CANALES                 2             /* ranuras I2S; el ES8311 es mono */
 #define BLOQUE_BYTES            (BLOQUE_TRAMAS * CANALES * (int)sizeof(int16_t))
+#define BLOQUE_MS               (BLOQUE_TRAMAS * 1000 / FRECUENCIA_HZ)
+#define DMA_DESCRIPTORES        6
+#define TX_BLOQUES_PREPARADOS    4
+#define TX_ESPERA_MS            (2 * BLOQUE_MS)
 
 #define GRABACION_SEGUNDOS       10
 #define GRABACION_MUESTRAS       (FRECUENCIA_HZ * GRABACION_SEGUNDOS)
@@ -118,21 +122,20 @@
 #define RGB_LED_GPIO            45
 #define RGB_LED_COUNT           1
 
-/* --- Prioridades: por PLAZO, no por importancia (rate-monotonic) ---------
- *
- *   captura   bloque de 32 ms: plazo más exigente, el DMA no espera
- *   tactil    respuesta humana ~100 ms; el trabajo por pulsación es breve
- *   proceso   el plazo de captura
- *   grabacion mantiene el ritmo promedio del audio, dispone de buffers para absorber demoras breves,
- *  pero no debe retrasar captura
- *   interfaz  refresco visual:      si se retrasa 100 ms, nadie lo ve
- *
- * `captura` va por debajo de `tactil` a propósito: la tarea del táctil hace
- * cuatro cosas y se bloquea; nunca puede robarle 32 ms a nadie. */
+/* RX y TX consumen un bloque cada 32 ms. Captura va primero porque perder
+ * entrada es irreversible. Reproducción queda justo debajo y prepara audio
+ * antes que el táctil (~100 ms), las medidas de nivel y la pantalla.
+ * Los cuatro bloques preparados absorben demoras breves, pero no reemplazan
+ * el requisito de producir, en promedio, un bloque cada 32 ms. */
 #define PRIO_CAPTURA             9
-#define PRIO_TACTIL            8
+/* Un bloque cada 32 ms. Prioridad debajo de captura y encima de las
+ * tareas de interfaz para reponer audio antes de agotar la reserva. */
+#define PRIO_REPRODUCCION        8
+#define PRIO_TACTIL              7
 #define PRIO_PROCESO            6
-#define PRIO_GRABACION          5
+/* Procesa transiciones, sin alimentar DMA. Objetivo de respuesta:
+ * 100 ms, pendiente de verificar; puede esperar detrás del audio. */
+#define PRIO_CONTROL_AUDIO      5
 #define PRIO_INTERFAZ           3
 
 #define PILA_TACTIL             4096          /* habla con el códec por I2C */
@@ -264,12 +267,6 @@ typedef enum {
     AUDIO_EVT_REPRODUCCION_FINALIZADA
 } evento_audio_t;
 
-static const char *NOMBRE_ESTADO_AUDIO[] = {
-    "LISTO",
-    "GRABANDO",
-    "REPRODUCIENDO"
-};
-
 static const char *NOMBRE_MODO[MODO_N] = { "VU", "PPM", "CRUDO" };
 
 typedef struct {
@@ -297,6 +294,20 @@ static QueueHandle_t s_cola_control_audio;
 static TaskHandle_t s_tarea_control_audio;
 static TaskHandle_t s_tarea_reproduccion;
 
+typedef struct {
+    int16_t muestras[BLOQUE_TRAMAS * CANALES];
+    bool ultimo;
+} bloque_tx_t;
+
+static QueueHandle_t s_tx_libres;
+static QueueHandle_t s_tx_listos;
+static portMUX_TYPE s_mux_tx = portMUX_INITIALIZER_UNLOCKED;
+static bool s_tx_activo;
+static bool s_tx_abortado;
+static void *s_tx_ultimo_dma;
+static unsigned s_tx_drenaje;
+static uint32_t s_tx_atrasos;
+
 static estado_t s_estado = {
     .db_q8 = DB_SUELO_Q8,
     .pico_db_q8 = DB_SUELO_Q8,
@@ -305,7 +316,7 @@ static estado_t s_estado = {
 };
 
 static i2s_chan_handle_t      s_i2s_rx;
-static i2s_chan_handle_t      s_i2s_tx;       /* en marcha y en silencio: App 5 */
+static i2s_chan_handle_t      s_i2s_tx;       /* silencio fuera de reproducción */
 static esp_codec_dev_handle_t s_codec;
 static led_strip_handle_t     s_led;
 static touch_sensor_handle_t  s_touch;
@@ -313,7 +324,6 @@ static int16_t *s_buffer_grabacion = NULL;
 
 /* Buffer de audio mono: 10 s, 16 kHz, 16 bits, reservado en PSRAM. */
 static size_t s_muestras_grabadas;
-static bool s_solicitar_grabacion;
 
 /* Diagnóstico. Cada contador lo escribe una sola tarea. */
 static uint32_t s_medida_max_us;     /* peor caso de medir un bloque        */
@@ -334,7 +344,7 @@ static const boton_t BOTONES[] = {
     { 2, "PLAY"     },   /* cambia la balística: VU -> PPM -> CRUDO       */
     { 1, "VOL_UP"   },   /* sube la ganancia del micrófono                */
     { 3, "VOL_DOWN" },   /* la baja                                       */
-    { 5, "RECORD"   },   /* reinicia el pico retenido y los recortes      */
+    { 5, "RECORD"   },   /* graba si está LISTO; reinicia pico y recortes */
 };
 #define BOTONES_N   (sizeof(BOTONES) / sizeof(BOTONES[0]))
 
@@ -371,11 +381,57 @@ static void configurar_led(void)
 /* El I2S mueve las muestras; el I2C configura el códec. Son dos buses
  * distintos con dos trabajos distintos, y confundirlos es el malentendido más
  * común al empezar con audio: por el I2S no se manda "sube el volumen". */
+/* El callback solo repone un descriptor ya enviado. No accede a PSRAM,
+ * no imprime y no espera: la conversión se hace en la tarea. */
+static bool IRAM_ATTR al_enviar_audio(i2s_chan_handle_t canal,
+                                    i2s_event_data_t *ev, void *ctx)
+{
+    BaseType_t despertar = pdFALSE;
+    bool terminado = false;
+
+    portENTER_CRITICAL_ISR(&s_mux_tx);
+    if (s_tx_activo) {
+        if (s_tx_abortado) {
+            /* Una vuelta completa deja salir el audio pendiente y borra
+             * todos los descriptores mediante auto_clear_before_cb. */
+            terminado = (--s_tx_drenaje == 0);
+        } else if (s_tx_ultimo_dma != NULL) {
+            terminado = (ev->dma_buf == s_tx_ultimo_dma);
+        } else {
+            bloque_tx_t *bloque;
+            if (xQueueReceiveFromISR(s_tx_listos, &bloque, &despertar) == pdTRUE) {
+                memcpy(ev->dma_buf, bloque->muestras, BLOQUE_BYTES);
+                if (bloque->ultimo) {
+                    s_tx_ultimo_dma = ev->dma_buf;
+                }
+                xQueueSendFromISR(s_tx_libres, &bloque, &despertar);
+            } else {
+                /* Falta audio preparado: este descriptor queda en silencio.
+                 * Abortamos en lugar de continuar una grabación con huecos. */
+                s_tx_atrasos++;
+                s_tx_abortado = true;
+                s_tx_drenaje = DMA_DESCRIPTORES;
+            }
+        }
+        if (terminado) {
+            s_tx_activo = false;
+            vTaskNotifyGiveFromISR(s_tarea_reproduccion, &despertar);
+        }
+    }
+    portEXIT_CRITICAL_ISR(&s_mux_tx);
+    return despertar == pdTRUE;
+}
+
 static void configurar_i2s(void)
 {
     i2s_chan_config_t chan = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PUERTO, I2S_ROLE_MASTER);
     /* Con auto_clear, un tx al que nadie escribe manda ceros: silencio. */
-    chan.auto_clear = true;
+    chan.dma_desc_num = DMA_DESCRIPTORES;
+    chan.dma_frame_num = BLOQUE_TRAMAS;
+    /* Borrar antes permite que el callback reponga audio sin que el driver
+     * lo borre después. Sin un bloque preparado, salen ceros. */
+    chan.auto_clear_after_cb = false;
+    chan.auto_clear_before_cb = true;
     /* Se crean los dos canales aunque hoy solo se lea de rx. En el ESP32-S2
      * tx y rx comparten BCLK y WS, y los genera el canal que se inicializa
      * PRIMERO; el otro queda de esclavo interno. Tiene que ser el tx: es lo
@@ -402,6 +458,8 @@ static void configurar_i2s(void)
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_tx, &std));   /* maestro */
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_rx, &std));
+    const i2s_event_callbacks_t callbacks = { .on_sent = al_enviar_audio };
+    ESP_ERROR_CHECK(i2s_channel_register_event_callback(s_i2s_tx, &callbacks, NULL));
 
     /*
     * DECISION DE DISEÑO: coexistencia de grabacion y reproduccion.
@@ -530,7 +588,7 @@ static bool IRAM_ATTR al_tocar(touch_sensor_handle_t sensor,
 /*  TAREA 1 — captura:  el único plazo duro del programa                     */
 /* ======================================================================== */
 
-/* Prioridad 8. Se bloquea en i2s_channel_read() hasta que el DMA tiene un
+/* Prioridad 9. Se bloquea en i2s_channel_read() hasta que el DMA tiene un
  * bloque completo, lo mide y encola el RESULTADO. No formatea, no dibuja y no
  * imprime: cada microsegundo que pasa aquí es un microsegundo que el DMA está
  * llenando el siguiente descriptor sin nadie que lo recoja. */
@@ -1020,6 +1078,7 @@ static void tarea_control_audio(void *arg)
 
     while (xQueueReceive(s_cola_control_audio, &ev, portMAX_DELAY) == pdTRUE) {
         bool iniciar_reproduccion = false;
+        const char *mensaje = NULL;
 
         xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
 
@@ -1028,7 +1087,7 @@ static void tarea_control_audio(void *arg)
             if (s_estado.audio == AUDIO_LISTO) {
                 s_muestras_grabadas = 0;
                 s_estado.audio = AUDIO_GRABANDO;
-                ESP_LOGI(TAG, "[audio] comienza grabacion");
+                mensaje = "comienza grabacion";
             }
             break;
 
@@ -1037,20 +1096,23 @@ static void tarea_control_audio(void *arg)
                 s_muestras_grabadas >= GRABACION_MUESTRAS) {
                 s_estado.audio = AUDIO_REPRODUCIENDO;
                 iniciar_reproduccion = true;
-                ESP_LOGI(TAG, "[audio] grabacion completa; comienza reproduccion");
+                mensaje = "grabacion completa; comienza reproduccion";
             }
             break;
 
         case AUDIO_EVT_REPRODUCCION_FINALIZADA:
             if (s_estado.audio == AUDIO_REPRODUCIENDO) {
                 s_estado.audio = AUDIO_LISTO;
-                ESP_LOGI(TAG, "[audio] reproduccion finalizada");
+                mensaje = "reproduccion terminada; LISTO";
             }
             break;
         }
 
         xSemaphoreGive(s_mutex_estado);
 
+        if (mensaje != NULL) {
+            ESP_LOGI(TAG, "[audio] %s", mensaje);
+        }
         if (iniciar_reproduccion) {
             xTaskNotifyGive(s_tarea_reproduccion);
         }
@@ -1060,58 +1122,91 @@ static void tarea_control_audio(void *arg)
 
 static void tarea_reproduccion(void *arg)
 {
-    /* El TX necesita bloques estéreo en memoria interna apta para DMA. */
-    int16_t *estereo = heap_caps_malloc(
-        BLOQUE_BYTES,
-        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
-    );
-    ESP_ERROR_CHECK(estereo != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+    /* El callback necesita leer estos bloques aun cuando PSRAM no esté
+     * accesible. Las colas transportan punteros, no copias de 2 KB. */
+    bloque_tx_t *bloques = heap_caps_calloc(TX_BLOQUES_PREPARADOS,
+        sizeof(bloque_tx_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ESP_ERROR_CHECK(bloques != NULL ? ESP_OK : ESP_ERR_NO_MEM);
 
     while (1) {
         /* Esperar hasta que la controladora habilite la reproducción. */
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+        xQueueReset(s_tx_libres);
+        xQueueReset(s_tx_listos);
+        for (size_t i = 0; i < TX_BLOQUES_PREPARADOS; i++) {
+            bloque_tx_t *bloque = &bloques[i];
+            xQueueSend(s_tx_libres, &bloque, 0);
+        }
+        portENTER_CRITICAL(&s_mux_tx);
+        s_tx_abortado = false;
+        s_tx_ultimo_dma = NULL;
+        portEXIT_CRITICAL(&s_mux_tx);
+
         size_t offset = 0;
-        bool correcta = true;
+        unsigned preparados = 0;
 
         while (offset < GRABACION_MUESTRAS) {
+            bloque_tx_t *bloque;
+            if (xQueueReceive(s_tx_libres, &bloque,
+                              pdMS_TO_TICKS(TX_ESPERA_MS)) != pdTRUE) {
+                portENTER_CRITICAL(&s_mux_tx);
+                if (s_tx_activo && !s_tx_abortado) {
+                    s_tx_abortado = true;
+                    s_tx_drenaje = DMA_DESCRIPTORES;
+                    s_tx_atrasos++;
+                }
+                portEXIT_CRITICAL(&s_mux_tx);
+                break;
+            }
+            portENTER_CRITICAL(&s_mux_tx);
+            const bool abortado = s_tx_abortado;
+            portEXIT_CRITICAL(&s_mux_tx);
+            if (abortado) {
+                break;
+            }
             size_t tramas = GRABACION_MUESTRAS - offset;
 
             if (tramas > BLOQUE_TRAMAS) {
                 tramas = BLOQUE_TRAMAS;
             }
 
-            /* Expandir mono a estéreo: misma muestra en L y R. */
+            /* El último bloque lleva silencio después de la última muestra:
+             * así todos los descriptores conservan el mismo tamaño. */
+            memset(bloque->muestras, 0, sizeof(bloque->muestras));
             for (size_t i = 0; i < tramas; i++) {
                 int16_t muestra = s_buffer_grabacion[offset + i];
-                estereo[2 * i]     = muestra;
-                estereo[2 * i + 1] = muestra;
+                bloque->muestras[2 * i]     = muestra;
+                bloque->muestras[2 * i + 1] = muestra;
             }
-
-            size_t bytes = tramas * CANALES * sizeof(int16_t);
-            size_t escritos = 0;
-
-            esp_err_t err = i2s_channel_write(
-                s_i2s_tx, estereo, bytes, &escritos, 1000
-            );
-
-            if (err != ESP_OK || escritos != bytes) {
-                ESP_LOGE(TAG,
-                         "[reproduccion] error TX: err=%s, escritos=%u/%u",
-                         esp_err_to_name(err),
-                         (unsigned)escritos, (unsigned)bytes);
-                correcta = false;
-                break;
-            }
-
             offset += tramas;
+            bloque->ultimo = (offset == GRABACION_MUESTRAS);
+            ESP_ERROR_CHECK(xQueueSend(s_tx_listos, &bloque, 0) == pdTRUE
+                            ? ESP_OK : ESP_FAIL);
+            if (++preparados == TX_BLOQUES_PREPARADOS) {
+                /* Arrancar con cuatro bloques evita confundir el inicio
+                 * normal de la tarea con una falta de audio. */
+                portENTER_CRITICAL(&s_mux_tx);
+                s_tx_activo = true;
+                portEXIT_CRITICAL(&s_mux_tx);
+            }
         }
 
-        if (correcta) {
-            ESP_LOGI(TAG, "[reproduccion] audio enviado completamente");
-        } else {
-            ESP_LOGW(TAG, "[reproduccion] reproduccion interrumpida");
-        }
+        /* La notificación llega al salir el último descriptor, no al copiar
+         * su contenido. Se cuentan también los bloques aún en la cola,
+         * una vuelta DMA completa y dos períodos de margen.
+         * Si el periférico deja de avanzar, reiniciamos antes que declarar
+         * LISTO con audio cuyo estado ya no conocemos. */
+        ESP_ERROR_CHECK(ulTaskNotifyTake(pdTRUE,
+            pdMS_TO_TICKS((TX_BLOQUES_PREPARADOS + DMA_DESCRIPTORES + 2)
+                          * BLOQUE_MS)) != 0
+            ? ESP_OK : ESP_ERR_TIMEOUT);
+        portENTER_CRITICAL(&s_mux_tx);
+        const bool abortado = s_tx_abortado;
+        const uint32_t atrasos = s_tx_atrasos;
+        portEXIT_CRITICAL(&s_mux_tx);
+        ESP_LOGI(TAG, "[reproduccion] %s; atrasos acumulados: %" PRIu32,
+                 abortado ? "abortada por falta de audio" : "finalizada", atrasos);
 
         evento_audio_t fin = AUDIO_EVT_REPRODUCCION_FINALIZADA;
         xQueueSend(s_cola_control_audio, &fin, portMAX_DELAY);
@@ -1136,7 +1231,9 @@ static const char *nombre_estado(eTaskState s)
 
 static void informe(TimerHandle_t t)
 {
-    static const char *TAREAS[] = { "tactil", "captura", "proceso", "interfaz" };
+    static const char *TAREAS[] = {
+        "captura", "reproduccion", "tactil", "proceso", "control_audio", "interfaz"
+    };
 
     xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
     const estado_t e = s_estado;
@@ -1280,8 +1377,11 @@ void app_main(void)
 
 
     s_cola_control_audio = xQueueCreate(4, sizeof(evento_audio_t));
+    s_tx_libres = xQueueCreate(TX_BLOQUES_PREPARADOS, sizeof(bloque_tx_t *));
+    s_tx_listos = xQueueCreate(TX_BLOQUES_PREPARADOS, sizeof(bloque_tx_t *));
     
-    ESP_ERROR_CHECK((s_cola_niveles && s_cola_toques && s_cola_control_audio && s_mutex_estado)
+    ESP_ERROR_CHECK((s_cola_niveles && s_cola_toques && s_cola_control_audio &&
+                    s_mutex_estado && s_tx_libres && s_tx_listos)
                         ? ESP_OK : ESP_ERR_NO_MEM);
 
     s_buffer_grabacion = heap_caps_malloc(
@@ -1293,7 +1393,7 @@ void app_main(void)
 
     s_muestras_grabadas = 0;
 
-    ESP_LOGI(TAG, "Memoria reservada para grabacion: %d bytes",
+    ESP_LOGI(TAG, "Memoria reservada para grabacion: %zu bytes",
          GRABACION_BYTES);
 
     configurar_i2s();
@@ -1318,9 +1418,9 @@ void app_main(void)
     xTaskCreate(tarea_interfaz, "interfaz", PILA_INTERFAZ, NULL, PRIO_INTERFAZ,
                 &s_tarea_interfaz);
     xTaskCreate(tarea_reproduccion, "reproduccion",
-                4096, NULL, PRIO_GRABACION, &s_tarea_reproduccion);
+                4096, NULL, PRIO_REPRODUCCION, &s_tarea_reproduccion);
     xTaskCreate(tarea_control_audio, "control_audio",
-                3072, NULL, PRIO_GRABACION, &s_tarea_control_audio);
+                3072, NULL, PRIO_CONTROL_AUDIO, &s_tarea_control_audio);
     xTaskCreate(tarea_tactil,   "tactil",   PILA_TACTIL,   NULL, PRIO_TACTIL,   NULL);
     xTaskCreate(tarea_captura,  "captura",  PILA_CAPTURA,  NULL, PRIO_CAPTURA,  NULL);
     xTaskCreate(tarea_proceso,  "proceso",  PILA_PROCESO,  NULL, PRIO_PROCESO,  NULL);

@@ -6,11 +6,11 @@
 Firmware base de la **App 5**. El micrófono de la **ESP-LyraT-8311A** entra por el códec **ES8311**, viaja por **I2S con DMA** hasta la SRAM y se convierte en un nivel en decibelios que se pinta en la **TFT**, en el **LED RGB** y en la consola.
 
 ```
-   micro ──▶ ES8311 ──I2S/DMA──▶ [captura p8] ──cola──▶ [proceso p6] ──┐
+   micro ──▶ ES8311 ──I2S/DMA──▶ [captura p9] ──cola──▶ [proceso p6] ──┐
               (I2C: control)      RMS, pico,          balística        │ mutex
                                   recortes           VU / PPM          ▼
                                                                 ┌────────────┐
-   [tactil p9] ──notificación──────────────────────────────────▶│  estado    │
+   [tactil p7] ──cola de control───────────────────────────────▶│  estado    │
     cola de la ISR del táctil                                   │ compartido │
                                                                 └────────────┘
                                                                        │ mutex
@@ -107,16 +107,66 @@ Fondo azul muy oscuro, casi negro. Arriba, el título en blanco. Debajo, el nive
 
 Si el fondo sale claro y las letras oscuras, la imagen está **en negativo**; si el texto se lee al revés, está **en espejo**. Las dos cosas dependen del panel y se corrigen en `pantalla.c`: ver «Solución de problemas».
 
-## Las cuatro tareas
+## Grabación y reproducción
+
+La máquina `LISTO → GRABANDO → REPRODUCIENDO → LISTO` vive en
+`s_estado.audio`, bajo `s_mutex_estado`. Solo `tarea_control_audio` cambia
+ese estado. El táctil solicita la grabación por una cola; captura consulta
+el estado en cada bloque y avisa por la misma cola al completar las muestras.
+Control despierta a reproducción mediante una notificación directa. Al terminar
+la transmisión, reproducción envía el evento que permite volver a LISTO.
+RECORD durante una operación no inicia otra grabación.
+
+Se guardan `10 × 16.000 × 2 = 320.000 bytes` (312,5 KiB) en PSRAM mediante
+`MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT`. Es audio mono de 16 bits: se conserva
+solo la ranura izquierda de I2S. No se dedica la SRAM interna a esa grabación
+porque también aloja el sistema, las pilas, las colas y los buffers DMA.
+Al reproducir, cada muestra mono se duplica a izquierda y derecha.
+
+RX y TX permanecen habilitados, con el ES8311 en modo `BOTH` y el dispositivo
+abierto como `IN_OUT`. RX sigue actualizando el medidor durante la reproducción,
+sin sobrescribir las muestras guardadas.
+
+El DMA tiene seis descriptores de 512 tramas: cada descriptor representa
+32 ms y 2.048 bytes estéreo. Son 192 ms de capacidad nominal por canal;
+no significa que siempre haya 192 ms de audio preparado. La tarea de
+reproducción prepara cuatro bloques adicionales en memoria interna (128 ms
+de reserva inicial). Las colas intercambian punteros y mantienen la propiedad
+de cada bloque: libre → tarea → listo → callback → libre.
+
+El callback `on_sent` repone el descriptor que acaba de salir. Solo copia un
+bloque preparado, sin esperar, acceder a PSRAM ni imprimir. Se borra el buffer
+antes del callback para que, sin audio nuevo, se transmita silencio. La tarea
+debe sostener un bloque cada 32 ms; una vez llena la cola, debe reponer cada
+bloque liberado antes de agotar los restantes. Tiene prioridad 8, por debajo
+de captura (9), pero por encima del táctil (7), proceso (6) e interfaz (3).
+La reserva absorbe demoras breves; no soluciona una sobrecarga sostenida.
+
+**Política de atrasos:** si el callback no encuentra un bloque listo durante
+la reproducción, cuenta un atraso y aborta. No continúa la grabación con un
+hueco: deja salir los descriptores pendientes y mantiene silencio después.
+También aborta si la tarea espera 64 ms por un bloque libre sin recibirlo.
+El regreso a LISTO ocurre después del drenaje, tanto en el caso normal como
+en el de aborto. El último bloque se completa con ceros (hasta 31 ms).
+Si no llega la confirmación del DMA en doce períodos (384 ms), se registra un
+error fatal y se reinicia, en lugar de anunciar LISTO sin confirmar la salida.
+
+Queda por validar en placa el costo del callback, la continuidad con pantalla
+y táctil activos, varias grabaciones consecutivas y el aborto al demorar la
+tarea productora más que su reserva. La compilación no demuestra esos plazos.
+
+## Las tareas
 
 | Tarea              | Prio | Espera en             | Trabajo                                | Por qué esa prioridad                                   |
 | ------------------ | :--: | --------------------- | -------------------------------------- | -------------------------------------------------------- |
-| **tactil**   |  9  | Cola de la ISR        | Balística, ganancia, reinicio de pico | Responde a una persona, y hace cuatro cosas y se bloquea |
-| **captura**  |  8  | `i2s_channel_read`  | RMS, pico, recortes de cada bloque     | **El único plazo duro**: 32 ms y el DMA no espera |
+| **captura** | 9 | `i2s_channel_read` | Medir y guardar audio | Un bloque cada 32 ms; perder entrada es irreversible |
+| **reproduccion** | 8 | Cola de bloques libres / notificación | Preparar estéreo y esperar el final real de TX | Sostener un bloque cada 32 ms |
+| **tactil** | 7 | Cola de la ISR | Balística, ganancia, solicitar grabación | Respuesta humana, del orden de 100 ms |
 | **proceso**  |  6  | Cola de niveles       | dBFS y balística del instrumento      | Consume lo que produce`captura`                        |
+| **control_audio** | 5 | Cola de eventos | Gobernar la máquina de estados | Se ejecuta en las transiciones, sin alimentar DMA |
 | **interfaz** |  3  | Notificación o plazo | TFT, LED y panel por consola           | Si se retrasa 100 ms, nadie lo nota                      |
 
-> `captura` va **por debajo** de `tactil` a propósito. Parece contradictorio —el audio es lo urgente— pero la tarea del táctil solo cambia cuatro variables y se vuelve a bloquear: nunca puede robarle 32 ms a nadie. Poner el audio arriba del todo no lo haría más rápido, y dejaría los botones sin atender durante los picos de carga.
+> Las tareas de audio preceden al táctil y al dibujo. Los mensajes de la controladora se imprimen después de liberar el mutex para no bloquear captura durante la salida por consola.
 
 ## Mapa de botones
 
@@ -125,7 +175,7 @@ Si el fondo sale claro y las letras oscuras, la imagen está **en negativo**; si
 | **PLAY**     |  T2  | Cambia la**balística**: VU → PPM → CRUDO      |
 | **VOL_UP**   |  T1  | Sube la ganancia del micrófono, de 6 en 6 dB hasta 36 |
 | **VOL_DOWN** |  T3  | La baja hasta 0                                        |
-| **RECORD**   |  T5  | Reinicia el pico retenido y el contador de recortes    |
+| **RECORD**   |  T5  | Reinicia pico y recortes; si está LISTO, graba 10 s y reproduce |
 
 ### Las tres balísticas, y por qué no son cosmética
 

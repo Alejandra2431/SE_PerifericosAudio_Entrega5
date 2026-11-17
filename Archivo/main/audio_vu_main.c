@@ -331,7 +331,73 @@ static size_t s_muestras_grabadas;
 /* Diagnóstico. Cada contador lo escribe una sola tarea. */
 static uint32_t s_medida_max_us;     /* peor caso de medir un bloque        */
 static uint32_t s_dibujo_max_us;     /* peor caso de refrescar la pantalla  */
+static uint32_t s_dibujo_sin_barra_max_us;
 static uint32_t s_lecturas_cortas;   /* i2s_channel_read devolvió de menos  */
+
+/* Se actualizan en captura y se copian bajo el mutex para imprimir. */
+static uint32_t s_captura_listo_max_us;
+static uint32_t s_captura_grabando_max_us;
+static uint32_t s_grabacion_bloques;
+static uint32_t s_grabacion_perdidos;
+static uint32_t s_grabacion_cortas;
+static uint32_t s_grabacion_recortes;
+
+static void informar_presupuesto(const char *condicion, uint32_t us)
+{
+    const uint32_t porcentaje = (uint64_t)us * 10000 / (BLOQUE_MS * 1000);
+    ESP_LOGI(TAG, "[medidas] captura %s: max %" PRIu32
+             " us, %" PRIu32 ".%02" PRIu32 " %% del bloque",
+             condicion, us, porcentaje / 100, porcentaje % 100);
+}
+
+/* Comparamos la misma copia estéreo a mono antes de iniciar el audio.
+ * SRAM reutiliza un bloque; PSRAM avanza por la grabación, como al grabar.
+ * volatile evita que el compilador elimine las escrituras de la prueba. */
+static void medir_memorias(void)
+{
+    const unsigned repeticiones = 256;
+    int16_t *origen = heap_caps_malloc(BLOQUE_BYTES,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    volatile int16_t *sram = heap_caps_malloc(BLOQUE_TRAMAS * sizeof(int16_t),
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ESP_ERROR_CHECK(origen && sram ? ESP_OK : ESP_ERR_NO_MEM);
+    for (size_t i = 0; i < BLOQUE_TRAMAS * CANALES; i++) {
+        origen[i] = (int16_t)(i * 17);
+    }
+
+    int64_t tiempo_sram = 0, tiempo_psram = 0;
+    for (unsigned r = 0; r < repeticiones; r++) {
+        int64_t inicio = esp_timer_get_time();
+        for (size_t i = 0; i < BLOQUE_TRAMAS; i++) {
+            sram[i] = origen[i * CANALES];
+        }
+        tiempo_sram += esp_timer_get_time() - inicio;
+
+        volatile int16_t *psram = s_buffer_grabacion + r * BLOQUE_TRAMAS;
+        inicio = esp_timer_get_time();
+        for (size_t i = 0; i < BLOQUE_TRAMAS; i++) {
+            psram[i] = origen[i * CANALES];
+        }
+        tiempo_psram += esp_timer_get_time() - inicio;
+    }
+    const int64_t sram_centesimas = tiempo_sram * 100 / repeticiones;
+    const int64_t psram_centesimas = tiempo_psram * 100 / repeticiones;
+    const int64_t diferencia = (tiempo_psram - tiempo_sram) * 1000000 /
+        ((int64_t)repeticiones * BLOQUE_MS * 1000);
+    const int64_t absoluto = diferencia < 0 ? -diferencia : diferencia;
+    ESP_LOGI(TAG, "[medidas] copia de 512 muestras, %u repeticiones", repeticiones);
+    ESP_LOGI(TAG, "[medidas] SRAM: total %" PRId64 " us, promedio %" PRId64
+             ".%02" PRId64 " us/bloque", tiempo_sram,
+             sram_centesimas / 100, sram_centesimas % 100);
+    ESP_LOGI(TAG, "[medidas] PSRAM: total %" PRId64 " us, promedio %" PRId64
+             ".%02" PRId64 " us/bloque", tiempo_psram,
+             psram_centesimas / 100, psram_centesimas % 100);
+    ESP_LOGI(TAG, "[medidas] PSRAM - SRAM: %s%" PRId64 ".%04" PRId64
+             " puntos porcentuales del bloque", diferencia < 0 ? "-" : "",
+             absoluto / 10000, absoluto % 10000);
+    free(origen);
+    free((void *)sram);
+}
 
 /* --- Botones táctiles ----------------------------------------------------
  *
@@ -633,10 +699,12 @@ static void tarea_captura(void *arg)
 
         /* Guardar muestras mono en PSRAM mientras se graba. */
         bool avisar_fin = false;
+        size_t guardadas = 0;
 
         xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
 
         grabando = (s_estado.audio == AUDIO_GRABANDO);
+        const estado_audio_t estado_captura = s_estado.audio;
 
         /*
          * Durante GRABANDO, las muestras recibidas por RX se almacenan
@@ -646,6 +714,13 @@ static void tarea_captura(void *arg)
          * El VU usa el nivel de TX y el buffer de grabacion no se modifica.
          */
         if (grabando && !grabacion_completada && tramas > 0) {
+            if (s_muestras_grabadas == 0) {
+                s_captura_grabando_max_us = 0;
+                s_grabacion_bloques = 0;
+                s_grabacion_perdidos = 0;
+                s_grabacion_cortas = 0;
+                s_grabacion_recortes = 0;
+            }
             muestras_restantes =
                 GRABACION_MUESTRAS - s_muestras_grabadas;
 
@@ -655,12 +730,18 @@ static void tarea_captura(void *arg)
             }
 
             for (size_t i = 0; i < a_copiar; i++) {
+                const int16_t muestra = bloque[i * CANALES];
                 s_buffer_grabacion[s_muestras_grabadas + i] =
-                    bloque[i * CANALES];
+                    muestra;
+                if (muestra >= 32000 || muestra <= -32000) {
+                    s_grabacion_recortes++;
+                }
             }
+            guardadas = a_copiar;
 
             s_muestras_grabadas += a_copiar;
             s_estado.muestras_actuales = s_muestras_grabadas;
+            s_estado.recortes = s_grabacion_recortes;
 
             if (s_muestras_grabadas >= GRABACION_MUESTRAS) {
                 grabacion_completada = true;
@@ -673,16 +754,6 @@ static void tarea_captura(void *arg)
         }
 
         xSemaphoreGive(s_mutex_estado);
-
-        if (avisar_fin) {
-            evento_audio_t fin = AUDIO_EVT_GRABACION_FINALIZADA;
-
-            if (xQueueSend(s_cola_control_audio, &fin, 0) != pdTRUE) {
-                grabacion_completada = false;
-                ESP_LOGW(TAG,
-                         "[captura] no se pudo avisar fin de grabacion; se reintentara");
-            }
-        }
 
         /* El ES8311 es MONO: su único convertidor sale en la ranura izquierda
          * de la trama estéreo. En la derecha esp_codec_dev deja la referencia
@@ -732,10 +803,32 @@ static void tarea_captura(void *arg)
          * y se cuenta. Bloquear aquí retrasaría la siguiente lectura de I2S y
          * la pérdida sería de AUDIO, que es mucho peor que perder una medida
          * de nivel. La política se elige, y se justifica. */
-        if (xQueueSend(s_cola_niveles, &n, 0) != pdTRUE) {
-            xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+        const bool perdido = xQueueSend(s_cola_niveles, &n, 0) != pdTRUE;
+        const uint32_t captura_us = (uint32_t)(esp_timer_get_time() - t0);
+        xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+        if (perdido) {
             s_estado.perdidos++;
-            xSemaphoreGive(s_mutex_estado);
+        }
+        if (estado_captura == AUDIO_LISTO && captura_us > s_captura_listo_max_us) {
+            s_captura_listo_max_us = captura_us;
+        }
+        if (guardadas > 0) {
+            s_grabacion_bloques++;
+            s_grabacion_perdidos += perdido;
+            s_grabacion_cortas += (tramas < BLOQUE_TRAMAS);
+            if (captura_us > s_captura_grabando_max_us) {
+                s_captura_grabando_max_us = captura_us;
+            }
+        }
+        xSemaphoreGive(s_mutex_estado);
+
+        /* Avisar después de contar el último bloque, para que el resumen
+         * incluya toda la grabación y no parte de la reproducción. */
+        if (avisar_fin) {
+            evento_audio_t fin = AUDIO_EVT_GRABACION_FINALIZADA;
+            if (xQueueSend(s_cola_control_audio, &fin, 0) != pdTRUE) {
+                grabacion_completada = false;
+            }
         }
     }
 }
@@ -778,9 +871,6 @@ static void tarea_proceso(void *arg)
         s_estado.db_q8 = actual;
         if (db_pico > s_estado.pico_db_q8) {
             s_estado.pico_db_q8 = db_pico;
-        }
-        if (audio == AUDIO_GRABANDO) {
-            s_estado.recortes += n.recortes;
         }
         xSemaphoreGive(s_mutex_estado);
 
@@ -977,16 +1067,6 @@ static void dibujar_nivel(const estado_t *e)
         pantalla_texto(16, 160, tiempo, 2, COLOR_TINTA, COLOR_FONDO);
         snprintf(tiempo_previo, sizeof(tiempo_previo), "%s", tiempo);
     }
-    const int progreso = muestras * BARRA_ANCHO / GRABACION_MUESTRAS;
-    if (progreso > progreso_previo) {
-        pantalla_rect(BARRA_X + progreso_previo, PROGRESO_Y,
-                      progreso - progreso_previo, PROGRESO_ALTO, COLOR_VERDE);
-    } else if (progreso < progreso_previo) {
-        pantalla_rect(BARRA_X + progreso, PROGRESO_Y,
-                      progreso_previo - progreso, PROGRESO_ALTO, COLOR_HUECO);
-    }
-    progreso_previo = progreso;
-
     /* La barra: lo que crece se pinta y lo que mengua se borra. Si además ha
      * cambiado de zona (de verde a ámbar, por ejemplo), hay que repintar
      * también lo que ya estaba. */
@@ -1038,6 +1118,23 @@ static void dibujar_nivel(const estado_t *e)
 
     ancho_previo = ancho;
     color_previo = color;
+
+    /* Primero medimos el refresco sin actualizar el progreso.
+     * El VU, el estado y los tiempos se incluyen en ambas medidas. */
+    const uint32_t sin_barra_us = (uint32_t)(esp_timer_get_time() - t0);
+    if (sin_barra_us > s_dibujo_sin_barra_max_us) {
+        s_dibujo_sin_barra_max_us = sin_barra_us;
+    }
+
+    const int progreso = muestras * BARRA_ANCHO / GRABACION_MUESTRAS;
+    if (progreso > progreso_previo) {
+        pantalla_rect(BARRA_X + progreso_previo, PROGRESO_Y,
+                      progreso - progreso_previo, PROGRESO_ALTO, COLOR_VERDE);
+    } else if (progreso < progreso_previo) {
+        pantalla_rect(BARRA_X + progreso, PROGRESO_Y,
+                      progreso_previo - progreso, PROGRESO_ALTO, COLOR_HUECO);
+    }
+    progreso_previo = progreso;
 
     /* pantalla_rect() y pantalla_texto() no vuelven hasta que el SPI termina,
      * así que esto es lo que la pantalla ha tardado de verdad. */
@@ -1126,6 +1223,7 @@ static void tarea_control_audio(void *arg)
     while (xQueueReceive(s_cola_control_audio, &ev, portMAX_DELAY) == pdTRUE) {
         bool iniciar_reproduccion = false;
         const char *mensaje = NULL;
+        uint32_t bloques = 0, perdidos = 0, cortas = 0, recortes = 0, grabando_us = 0;
 
         xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
 
@@ -1158,6 +1256,11 @@ static void tarea_control_audio(void *arg)
                 s_estado.audio = AUDIO_REPRODUCIENDO;
                 iniciar_reproduccion = true;
                 mensaje = "grabacion completa; comienza reproduccion";
+                bloques = s_grabacion_bloques;
+                perdidos = s_grabacion_perdidos;
+                cortas = s_grabacion_cortas;
+                recortes = s_grabacion_recortes;
+                grabando_us = s_captura_grabando_max_us;
             }
             break;
 
@@ -1179,6 +1282,13 @@ static void tarea_control_audio(void *arg)
 
         if (mensaje != NULL) {
             ESP_LOGI(TAG, "[audio] %s", mensaje);
+        }
+        if (ev == AUDIO_EVT_GRABACION_FINALIZADA && iniciar_reproduccion) {
+            ESP_LOGI(TAG, "[medidas] grabacion completa: %u muestras, %" PRIu32
+                     " bloques, perdidos cola %" PRIu32 ", lecturas cortas %" PRIu32
+                     ", recortes %" PRIu32,
+                     (unsigned)GRABACION_MUESTRAS, bloques, perdidos, cortas, recortes);
+            informar_presupuesto("GRABANDO", grabando_us);
         }
         if (iniciar_reproduccion) {
             xTaskNotifyGive(s_tarea_reproduccion);
@@ -1325,6 +1435,8 @@ static void informe(TimerHandle_t t)
 
     xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
     const estado_t e = s_estado;
+    const uint32_t listo_us = s_captura_listo_max_us;
+    const uint32_t grabando_us = s_captura_grabando_max_us;
     xSemaphoreGive(s_mutex_estado);
 
     ESP_LOGI(TAG, "--- Informe (cada %d s) ---------------------------------",
@@ -1348,7 +1460,11 @@ static void informe(TimerHandle_t t)
              FRECUENCIA_HZ, FRECUENCIA_HZ * 2, bloque_us);
     ESP_LOGI(TAG, "  medir un bloque: %" PRIu32 " us como mucho (%" PRIu32 " %% del bloque)",
              s_medida_max_us, (s_medida_max_us * 100) / bloque_us);
-    ESP_LOGI(TAG, "  refrescar la pantalla: %" PRIu32 " us como mucho  (%s)",
+    informar_presupuesto("LISTO", listo_us);
+    informar_presupuesto("GRABANDO", grabando_us);
+    ESP_LOGI(TAG, "  pantalla sin actualizar barra: %" PRIu32 " us max",
+             s_dibujo_sin_barra_max_us);
+    ESP_LOGI(TAG, "  pantalla con actualizar barra: %" PRIu32 " us max (%s)",
              s_dibujo_max_us, pantalla_controlador());
     ESP_LOGI(TAG, "  bloques %" PRIu32 "  perdidos %" PRIu32 "  lecturas cortas %" PRIu32
                   "  cola %u/%d",
@@ -1480,6 +1596,7 @@ void app_main(void)
     );
 
     ESP_ERROR_CHECK(s_buffer_grabacion != NULL ? ESP_OK : ESP_ERR_NO_MEM); 
+    medir_memorias();
 
     s_muestras_grabadas = 0;
 

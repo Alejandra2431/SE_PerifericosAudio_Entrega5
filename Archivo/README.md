@@ -164,6 +164,38 @@ Queda por validar en placa el costo del callback, la continuidad con pantalla
 y táctil activos, varias grabaciones consecutivas y el aborto al demorar la
 tarea productora más que su reserva. La compilación no demuestra esos plazos.
 
+## Medidas para el informe
+
+Al arrancar se comparan 256 copias de 512 muestras, tomando la ranura izquierda
+de un bloque estéreo. Se usa el mismo origen en SRAM para ambos destinos:
+SRAM reutiliza un bloque de 1.024 bytes y PSRAM avanza por el buffer de grabación.
+La prueba se ejecuta antes de iniciar I2S y muestra los totales, el promedio
+por bloque y la diferencia de presupuesto en puntos porcentuales.
+Es una comparación del coste de copia, no de la tarea completa:
+`(promedio PSRAM - promedio SRAM) / 32.000 × 100`.
+
+Cada 10 segundos se imprimen los máximos de captura en LISTO y GRABANDO,
+en microsegundos y como porcentaje del bloque de 32.000 us. Se mide desde
+el retorno de la lectura I2S hasta el envío de la medida a la cola; incluye
+la copia a PSRAM cuando se graba, pero no la espera bloqueada de la lectura.
+El máximo de LISTO se acumula desde el arranque; el de GRABANDO se reinicia
+en cada grabación. Antes de la primera grabación, su valor es cero.
+
+Al completar las 160.000 muestras se imprime un resumen de esa grabación.
+Los bloques perdidos son medidas rechazadas por la cola de niveles, no un
+contador de desbordamientos DMA. Las lecturas cortas son lecturas exitosas
+de menos de 512 tramas; el último bloque, del que solo se guardan 256 muestras,
+no es corto si I2S entregó las 512. Los recortes cuentan muestras guardadas
+con valor mayor o igual a 32.000 o menor o igual a -32.000.
+
+Los tiempos de pantalla son máximos desde el arranque: primero se mide VU,
+estado y textos, y luego el total incluyendo actualizar la barra de progreso.
+No incluyen el dibujo inicial del fondo. La barra permanece visible.
+
+Para tomar los datos, abrir el monitor desde el arranque, dejar al menos
+10 segundos en LISTO, grabar una vez y esperar reproducción, LISTO y el
+siguiente informe periódico. Conservar las líneas `[medidas]` y `pantalla`.
+
 ## Las tareas
 
 | Tarea              | Prio | Espera en             | Trabajo                                | Por qué esa prioridad                                   |

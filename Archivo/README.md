@@ -116,6 +116,9 @@ el estado en cada bloque y avisa por la misma cola al completar las muestras.
 Control despierta a reproducción mediante una notificación directa. Al terminar
 la transmisión, reproducción envía el evento que permite volver a LISTO.
 RECORD durante una operación no inicia otra grabación.
+PLAY en LISTO repite la última grabación completa; sin una grabación previa
+solo informa que primero hay que grabar. Se conserva la reproducción automática
+al terminar los 10 segundos.
 
 Se guardan `10 × 16.000 × 2 = 320.000 bytes` (312,5 KiB) en PSRAM mediante
 `MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT`. Es audio mono de 16 bits: se conserva
@@ -124,8 +127,10 @@ porque también aloja el sistema, las pilas, las colas y los buffers DMA.
 Al reproducir, cada muestra mono se duplica a izquierda y derecha.
 
 RX y TX permanecen habilitados, con el ES8311 en modo `BOTH` y el dispositivo
-abierto como `IN_OUT`. RX sigue actualizando el medidor durante la reproducción,
-sin sobrescribir las muestras guardadas.
+abierto como `IN_OUT`. RX sigue leyendo sin sobrescribir las muestras guardadas.
+Durante la grabación, el VU mide el micrófono; durante la reproducción, mide
+los bloques digitales enviados por TX. El volumen del códec se aplica después
+de esa medida: el VU no mide el sonido físico del parlante.
 
 El DMA tiene seis descriptores de 512 tramas: cada descriptor representa
 32 ms y 2.048 bytes estéreo. Son 192 ms de capacidad nominal por canal;
@@ -141,6 +146,10 @@ debe sostener un bloque cada 32 ms; una vez llena la cola, debe reponer cada
 bloque liberado antes de agotar los restantes. Tiene prioridad 8, por debajo
 de captura (9), pero por encima del táctil (7), proceso (6) e interfaz (3).
 La reserva absorbe demoras breves; no soluciona una sobrecarga sostenida.
+Cada descriptor conserva la medida y la cantidad de muestras de su bloque.
+Al terminar de enviarlo, el callback actualiza el progreso y entrega el nivel
+por una cola de un elemento: para dibujar interesa la medida más reciente.
+Así el VU y el progreso siguen el audio transmitido, no el preparado por adelantado.
 
 **Política de atrasos:** si el callback no encuentra un bloque listo durante
 la reproducción, cuenta un atraso y aborta. No continúa la grabación con un
@@ -161,7 +170,7 @@ tarea productora más que su reserva. La compilación no demuestra esos plazos.
 | ------------------ | :--: | --------------------- | -------------------------------------- | -------------------------------------------------------- |
 | **captura** | 9 | `i2s_channel_read` | Medir y guardar audio | Un bloque cada 32 ms; perder entrada es irreversible |
 | **reproduccion** | 8 | Cola de bloques libres / notificación | Preparar estéreo y esperar el final real de TX | Sostener un bloque cada 32 ms |
-| **tactil** | 7 | Cola de la ISR | Balística, ganancia, solicitar grabación | Respuesta humana, del orden de 100 ms |
+| **tactil** | 7 | Cola de la ISR | Botones, ganancia y volumen | Respuesta humana, del orden de 100 ms |
 | **proceso**  |  6  | Cola de niveles       | dBFS y balística del instrumento      | Consume lo que produce`captura`                        |
 | **control_audio** | 5 | Cola de eventos | Gobernar la máquina de estados | Se ejecuta en las transiciones, sin alimentar DMA |
 | **interfaz** |  3  | Notificación o plazo | TFT, LED y panel por consola           | Si se retrasa 100 ms, nadie lo nota                      |
@@ -172,30 +181,25 @@ tarea productora más que su reserva. La compilación no demuestra esos plazos.
 
 | Serigrafía        | Canal | Acción                                                |
 | ------------------ | :---: | ------------------------------------------------------ |
-| **PLAY**     |  T2  | Cambia la**balística**: VU → PPM → CRUDO      |
-| **VOL_UP**   |  T1  | Sube la ganancia del micrófono, de 6 en 6 dB hasta 36 |
-| **VOL_DOWN** |  T3  | La baja hasta 0                                        |
+| **PLAY**     |  T2  | En LISTO, reproduce la última grabación completa |
+| **VOL_UP**   |  T1  | Sube volumen al reproducir; en GRABANDO o LISTO, sube ganancia |
+| **VOL_DOWN** |  T3  | Baja volumen al reproducir; en GRABANDO o LISTO, baja ganancia |
 | **RECORD**   |  T5  | Reinicia pico y recortes; si está LISTO, graba 10 s y reproduce |
 
-### Las tres balísticas, y por qué no son cosmética
+La ganancia cambia de 6 en 6 dB, entre 0 y 36 dB. El volumen cambia de 10
+en 10, entre 0 y 100. El VU conserva el suavizado de unos 250 ms.
 
-| Modo            | Ataque                 | Caída          | Para qué sirve                                                            |
-| --------------- | ---------------------- | --------------- | -------------------------------------------------------------------------- |
-| **VU**    | lento (~250 ms)        | lento           | Mide**sensación sonora**: es lo que hace un vúmetro de aguja       |
-| **PPM**   | **instantáneo** | lento (~750 ms) | Caza**picos**: es lo que hace falta para no recortar al grabar       |
-| **CRUDO** | ninguno                | ninguno         | Enseña el ruido de la propia medida, que es el que los otros dos esconden |
-
-> Un VU y un PPM **miden cosas distintas** con los mismos números. Con el modo CRUDO delante se entiende de golpe por qué existe la balística: sin filtrar, la aguja es ilegible.
+La TFT muestra LISTO, GRABANDO o REPRODUCIENDO, el VU, el tiempo transcurrido
+y restante y una barra de progreso. Los tiempos se calculan con las muestras
+guardadas o transmitidas a 16 kHz.
 
 ## Colores del LED
 
-| Color                 | Nivel                   | Significa                          |
-| --------------------- | ----------------------- | ---------------------------------- |
-| **Ámbar fijo** | —                      | Arrancando y calibrando el táctil |
-| **Azul tenue**  | por debajo de −45 dBFS | Silencio                           |
-| **Verde**       | −45 a −12 dBFS        | Zona de trabajo                    |
-| **Ámbar**      | −12 a −3 dBFS         | Cerca del tope                     |
-| **Rojo**        | por encima de −3 dBFS  | Al borde del recorte               |
+| Color | Estado |
+| ----- | ------ |
+| Apagado | LISTO |
+| Rojo | GRABANDO |
+| Verde | REPRODUCIENDO |
 
 ## Estructura
 

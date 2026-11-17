@@ -117,6 +117,8 @@
 #define GANANCIA_MAX_DB         36
 #define GANANCIA_PASO_DB        6
 #define GANANCIA_INICIAL_DB     24
+#define VOLUMEN_INICIAL         60
+#define VOLUMEN_PASO            10
 
 /* --- LED RGB ------------------------------------------------------------- */
 #define RGB_LED_GPIO            45
@@ -246,15 +248,6 @@ typedef struct {
     int64_t marca_us;
 } toque_t;
 
-/* Balística: cómo sube y baja la aguja. No es cosmética, es la diferencia
- * entre un VU y un PPM, y cambia lo que el instrumento sirve para medir. */
-typedef enum {
-    MODO_VU = 0,       /* lento en los dos sentidos: mide sensación sonora */
-    MODO_PPM,          /* ataque instantáneo, caída lenta: caza los picos  */
-    MODO_CRUDO,        /* sin suavizar: se ve el ruido de la medida        */
-    MODO_N
-} modo_t;
-
 typedef enum {
     AUDIO_LISTO = 0,
     AUDIO_GRABANDO,
@@ -263,11 +256,12 @@ typedef enum {
 
 typedef enum {
     AUDIO_EVT_SOLICITAR_GRABACION,
+    AUDIO_EVT_SOLICITAR_REPRODUCCION,
     AUDIO_EVT_GRABACION_FINALIZADA,
     AUDIO_EVT_REPRODUCCION_FINALIZADA
 } evento_audio_t;
 
-static const char *NOMBRE_MODO[MODO_N] = { "VU", "PPM", "CRUDO" };
+static const char *NOMBRE_AUDIO[] = { "LISTO", "GRABANDO", "REPRODUCIENDO" };
 
 typedef struct {
     int32_t  db_q8;           /* nivel mostrado, ya con balística          */
@@ -276,7 +270,8 @@ typedef struct {
     uint32_t bloques;
     uint32_t perdidos;        /* bloques que no cupieron en la cola        */
     int32_t  ganancia_db;
-    modo_t   modo;
+    int      volumen;
+    size_t   muestras_actuales;
     estado_audio_t audio;
 } estado_t;
 
@@ -296,6 +291,7 @@ static TaskHandle_t s_tarea_reproduccion;
 
 typedef struct {
     int16_t muestras[BLOQUE_TRAMAS * CANALES];
+    nivel_t nivel;
     bool ultimo;
 } bloque_tx_t;
 
@@ -307,11 +303,18 @@ static bool s_tx_abortado;
 static void *s_tx_ultimo_dma;
 static unsigned s_tx_drenaje;
 static uint32_t s_tx_atrasos;
+/* Cada posición acompaña a un descriptor hasta que termina de salir. */
+static nivel_t s_tx_niveles[DMA_DESCRIPTORES];
+static bool s_tx_con_audio[DMA_DESCRIPTORES];
+static unsigned s_tx_posicion;
+static size_t s_tx_muestras_enviadas;
+static QueueHandle_t s_cola_nivel_tx;
 
 static estado_t s_estado = {
     .db_q8 = DB_SUELO_Q8,
     .pico_db_q8 = DB_SUELO_Q8,
     .ganancia_db = GANANCIA_INICIAL_DB,
+    .volumen = VOLUMEN_INICIAL,
     .audio = AUDIO_LISTO,
 };
 
@@ -341,9 +344,9 @@ typedef struct {
 } boton_t;
 
 static const boton_t BOTONES[] = {
-    { 2, "PLAY"     },   /* cambia la balística: VU -> PPM -> CRUDO       */
-    { 1, "VOL_UP"   },   /* sube la ganancia del micrófono                */
-    { 3, "VOL_DOWN" },   /* la baja                                       */
+    { 2, "PLAY"     },   /* repite la última grabación si está LISTO     */
+    { 1, "VOL_UP"   },   /* volumen al reproducir, ganancia al grabar    */
+    { 3, "VOL_DOWN" },   /* volumen al reproducir, ganancia al grabar    */
     { 5, "RECORD"   },   /* graba si está LISTO; reinicia pico y recortes */
 };
 #define BOTONES_N   (sizeof(BOTONES) / sizeof(BOTONES[0]))
@@ -391,6 +394,13 @@ static bool IRAM_ATTR al_enviar_audio(i2s_chan_handle_t canal,
 
     portENTER_CRITICAL_ISR(&s_mux_tx);
     if (s_tx_activo) {
+        const unsigned pos = s_tx_posicion;
+        s_tx_posicion = (pos + 1) % DMA_DESCRIPTORES;
+        if (s_tx_con_audio[pos]) {
+            s_tx_muestras_enviadas += s_tx_niveles[pos].muestras;
+            xQueueOverwriteFromISR(s_cola_nivel_tx, &s_tx_niveles[pos], &despertar);
+            s_tx_con_audio[pos] = false;
+        }
         if (s_tx_abortado) {
             /* Una vuelta completa deja salir el audio pendiente y borra
              * todos los descriptores mediante auto_clear_before_cb. */
@@ -401,6 +411,8 @@ static bool IRAM_ATTR al_enviar_audio(i2s_chan_handle_t canal,
             bloque_tx_t *bloque;
             if (xQueueReceiveFromISR(s_tx_listos, &bloque, &despertar) == pdTRUE) {
                 memcpy(ev->dma_buf, bloque->muestras, BLOQUE_BYTES);
+                s_tx_niveles[pos] = bloque->nivel;
+                s_tx_con_audio[pos] = true;
                 if (bloque->ultimo) {
                     s_tx_ultimo_dma = ev->dma_buf;
                 }
@@ -560,7 +572,7 @@ static void configurar_codec(void)
     ESP_ERROR_CHECK(esp_codec_dev_open(s_codec, &muestreo)
                         == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL);
 
-    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(s_codec, 60)
+    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(s_codec, VOLUMEN_INICIAL)
                     == ESP_CODEC_DEV_OK ? ESP_OK : ESP_FAIL);
 
     ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(s_codec, (float)GANANCIA_INICIAL_DB)
@@ -630,9 +642,8 @@ static void tarea_captura(void *arg)
          * Durante GRABANDO, las muestras recibidas por RX se almacenan
          * en PSRAM.
          *
-         * Durante REPRODUCIENDO, RX sigue leyendo el microfono para
-         * actualizar el medidor, pero no modifica el buffer de grabacion,
-         * que contiene las muestras que utiliza la tarea de reproduccion.
+         * Durante REPRODUCIENDO, RX sigue leyendo pero no guarda muestras.
+         * El VU usa el nivel de TX y el buffer de grabacion no se modifica.
          */
         if (grabando && !grabacion_completada && tramas > 0) {
             muestras_restantes =
@@ -649,6 +660,7 @@ static void tarea_captura(void *arg)
             }
 
             s_muestras_grabadas += a_copiar;
+            s_estado.muestras_actuales = s_muestras_grabadas;
 
             if (s_muestras_grabadas >= GRABACION_MUESTRAS) {
                 grabacion_completada = true;
@@ -674,7 +686,7 @@ static void tarea_captura(void *arg)
 
         /* El ES8311 es MONO: su único convertidor sale en la ranura izquierda
          * de la trama estéreo. En la derecha esp_codec_dev deja la referencia
-         * del DAC, es decir, lo que se esté reproduciendo: hoy, silencio. Se
+         * del DAC, es decir, lo que se esté reproduciendo. Se
          * toma una de cada dos muestras; contar también la otra ranura
          * falsearía el nivel. */
         int32_t suma = 0;
@@ -732,47 +744,44 @@ static void tarea_captura(void *arg)
 /*  TAREA 2 — proceso:  la balística del instrumento                         */
 /* ======================================================================== */
 
-/* Prioridad 6. Convierte el eficaz en decibelios y le aplica la balística:
- * cuánto tarda la aguja en subir (ataque) y en bajar (caída). Un VU real
- * integra unos 300 ms; un PPM sube al instante y cae despacio. */
+/* Prioridad 6. Convierte el eficaz en decibelios y suaviza el VU. */
 static void tarea_proceso(void *arg)
 {
     nivel_t n;
 
     while (xQueueReceive(s_cola_niveles, &n, portMAX_DELAY) == pdTRUE) {
+        xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+        const estado_audio_t audio = s_estado.audio;
+        int32_t actual = s_estado.db_q8;
+        s_estado.bloques++;
+        xSemaphoreGive(s_mutex_estado);
+
+        /* Al reproducir usamos el nivel del bloque que ya salió por TX,
+         * no el micrófono ni los bloques preparados por adelantado. */
+        if (audio == AUDIO_REPRODUCIENDO &&
+            xQueueReceive(s_cola_nivel_tx, &n, 0) != pdTRUE) {
+            continue;
+        }
         const int32_t db = db_q8(n.rms, 32768);
         const int32_t db_pico = db_q8(n.pico, 32768);
-
-        xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
-        modo_t modo = s_estado.modo;
-        int32_t actual = s_estado.db_q8;
-        xSemaphoreGive(s_mutex_estado);
 
         /* Filtro de un polo, en enteros: nuevo = actual + (objetivo-actual)/k.
          * Cuanto mayor k, más lento. Con bloques de 32 ms, k=8 son ~250 ms de
          * constante de tiempo, que es justo la balística de un VU. */
-        switch (modo) {
-        case MODO_VU:
-            actual += (db - actual) / 8;
-            break;
-        case MODO_PPM:
-            /* Ataque instantáneo, caída lenta: así no se escapa ningún pico,
-             * que es exactamente para lo que sirve un medidor de picos. */
-            actual = (db > actual) ? db : actual + (db - actual) / 24;
-            break;
-        case MODO_CRUDO:
-        default:
-            actual = db;
-            break;
-        }
+        actual += (db - actual) / 8;
 
         xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+        if (s_estado.audio != audio) {
+            xSemaphoreGive(s_mutex_estado);
+            continue;
+        }
         s_estado.db_q8 = actual;
         if (db_pico > s_estado.pico_db_q8) {
             s_estado.pico_db_q8 = db_pico;
         }
-        s_estado.recortes += n.recortes;
-        s_estado.bloques++;
+        if (audio == AUDIO_GRABANDO) {
+            s_estado.recortes += n.recortes;
+        }
         xSemaphoreGive(s_mutex_estado);
 
         /* Un emisor, un receptor: la notificación directa es lo más barato
@@ -784,16 +793,6 @@ static void tarea_proceso(void *arg)
 /* ======================================================================== */
 /*  TAREA 3 — tactil                                                         */
 /* ======================================================================== */
-
-static void aplicar_ganancia(int32_t db)
-{
-    /* La API del códec pide un float. Es la única coma flotante del programa
-     * y está en el borde, donde no cuesta nada: la conversión ocurre una vez
-     * por pulsación, no una vez por muestra. */
-    if (esp_codec_dev_set_in_gain(s_codec, (float)db) != ESP_CODEC_DEV_OK) {
-        ESP_LOGW(TAG, "[tactil] el codec rechazo la ganancia %" PRId32 " dB", db);
-    }
-}
 
 static void tarea_tactil(void *arg)
 {
@@ -809,45 +808,58 @@ static void tarea_tactil(void *arg)
         }
 
         int32_t ganancia_nueva = -1;
+        int volumen_nuevo = -1;
+        bool enviar_evento = false;
+        evento_audio_t solicitud = AUDIO_EVT_SOLICITAR_GRABACION;
 
         xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
         if (ev.canal == BOTONES[0].canal) {                    /* PLAY */
-            s_estado.modo = (s_estado.modo + 1) % MODO_N;
-        } else if (ev.canal == BOTONES[1].canal) {             /* VOL_UP */
-            if (s_estado.ganancia_db < GANANCIA_MAX_DB) {
-                s_estado.ganancia_db += GANANCIA_PASO_DB;
-                ganancia_nueva = s_estado.ganancia_db;
-            }
-        } else if (ev.canal == BOTONES[2].canal) {             /* VOL_DOWN */
-            if (s_estado.ganancia_db > GANANCIA_MIN_DB) {
-                s_estado.ganancia_db -= GANANCIA_PASO_DB;
-                ganancia_nueva = s_estado.ganancia_db;
+            solicitud = AUDIO_EVT_SOLICITAR_REPRODUCCION;
+            enviar_evento = (s_estado.audio == AUDIO_LISTO);
+        } else if (ev.canal == BOTONES[1].canal ||
+                   ev.canal == BOTONES[2].canal) {           /* VOL +/- */
+            const int direccion = (ev.canal == BOTONES[1].canal) ? 1 : -1;
+            if (s_estado.audio == AUDIO_REPRODUCIENDO) {
+                volumen_nuevo = s_estado.volumen + direccion * VOLUMEN_PASO;
+                if (volumen_nuevo < 0) volumen_nuevo = 0;
+                if (volumen_nuevo > 100) volumen_nuevo = 100;
+            } else {
+                ganancia_nueva = s_estado.ganancia_db + direccion * GANANCIA_PASO_DB;
+                if (ganancia_nueva < GANANCIA_MIN_DB) ganancia_nueva = GANANCIA_MIN_DB;
+                if (ganancia_nueva > GANANCIA_MAX_DB) ganancia_nueva = GANANCIA_MAX_DB;
             }
         } else if (ev.canal == BOTONES[3].canal) {             /* RECORD */
-            s_estado.pico_db_q8 = DB_SUELO_Q8;
-            s_estado.recortes = 0;
-
-            if (s_estado.audio == AUDIO_LISTO) {
-                evento_audio_t solicitud =
-                    AUDIO_EVT_SOLICITAR_GRABACION;
-
-                if (xQueueSend(s_cola_control_audio, &solicitud, 0) != pdTRUE) {
-                    ESP_LOGW(TAG, "[audio] no se pudo enviar solicitud de grabacion");
-                }
-            }
+            enviar_evento = (s_estado.audio == AUDIO_LISTO);
         }
-        const estado_t e = s_estado;
         xSemaphoreGive(s_mutex_estado);
 
+        if (enviar_evento && xQueueSend(s_cola_control_audio, &solicitud, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "[audio] cola de control llena");
+        }
         /* Fuera del mutex: hablar por I2C con el códec tarda cientos de
          * microsegundos y no puede bloquear a las tareas de audio. */
         if (ganancia_nueva >= 0) {
-            aplicar_ganancia(ganancia_nueva);
+            if (esp_codec_dev_set_in_gain(s_codec, (float)ganancia_nueva) == ESP_CODEC_DEV_OK) {
+                xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+                s_estado.ganancia_db = ganancia_nueva;
+                xSemaphoreGive(s_mutex_estado);
+            }
+        }
+        if (volumen_nuevo >= 0) {
+            if (esp_codec_dev_set_out_vol(s_codec, volumen_nuevo) == ESP_CODEC_DEV_OK) {
+                xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+                s_estado.volumen = volumen_nuevo;
+                xSemaphoreGive(s_mutex_estado);
+            }
         }
 
-        ESP_LOGI(TAG, "[tactil] %s (T%d) -> modo %s  ganancia %" PRId32 " dB "
+        xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
+        const estado_t e = s_estado;
+        xSemaphoreGive(s_mutex_estado);
+        xTaskNotifyGive(s_tarea_interfaz);
+        ESP_LOGI(TAG, "[tactil] %s (T%d) -> ganancia %" PRId32 " dB volumen %d "
                       "| latencia ISR->tarea %" PRId64 " us",
-                 nombre, ev.canal, NOMBRE_MODO[e.modo], e.ganancia_db, latencia);
+                 nombre, ev.canal, e.ganancia_db, e.volumen, latencia);
     }
 }
 
@@ -860,10 +872,12 @@ static void tarea_tactil(void *arg)
 #define ESCALA_MAX_DB     0
 
 #define BARRA_X           16
-#define BARRA_Y           110
+#define BARRA_Y           90
 #define BARRA_ANCHO       288
-#define BARRA_ALTO        54
+#define BARRA_ALTO        40
 #define MARCA_ANCHO       3             /* la marca de pico retenido */
+#define PROGRESO_Y        188
+#define PROGRESO_ALTO     10
 
 static uint16_t COLOR_FONDO, COLOR_TINTA, COLOR_TENUE;
 static uint16_t COLOR_VERDE, COLOR_AMBAR, COLOR_ROJO, COLOR_HUECO;
@@ -895,9 +909,12 @@ static uint16_t color_por_nivel(int32_t db_q8)
 static void dibujar_fondo_fijo(void)
 {
     pantalla_limpiar(COLOR_FONDO);
-    pantalla_texto(16, 14, "VU  ES8311  16 KHZ", 2, COLOR_TINTA, COLOR_FONDO);
+    pantalla_texto(16, 10, "LISTO", 2, COLOR_TINTA, COLOR_FONDO);
     pantalla_rect(BARRA_X - 2, BARRA_Y - 2, BARRA_ANCHO + 4, BARRA_ALTO + 4, COLOR_TENUE);
     pantalla_rect(BARRA_X, BARRA_Y, BARRA_ANCHO, BARRA_ALTO, COLOR_HUECO);
+    pantalla_rect(BARRA_X - 1, PROGRESO_Y - 1, BARRA_ANCHO + 2,
+                  PROGRESO_ALTO + 2, COLOR_TENUE);
+    pantalla_rect(BARRA_X, PROGRESO_Y, BARRA_ANCHO, PROGRESO_ALTO, COLOR_HUECO);
 
     /* Marcas de escala cada 12 dB, con su número debajo. */
     for (int db = ESCALA_MIN_DB; db <= ESCALA_MAX_DB; db += 12) {
@@ -932,11 +949,43 @@ static void dibujar_nivel(const estado_t *e)
     static uint16_t color_previo;
     static char texto_previo[24] = "";
     static char pie_previo[40] = "";
+    static int estado_previo = -1;
+    static char tiempo_previo[40] = "";
+    static int progreso_previo = 0;
 
     const int64_t t0 = esp_timer_get_time();
     const int ancho = db_a_pixeles(e->db_q8);
     const uint16_t color = color_por_nivel(e->db_q8);
     const bool cambio_de_zona = (color != color_previo);
+
+    if ((int)e->audio != estado_previo) {
+        char estado[24];
+        snprintf(estado, sizeof(estado), "%-13s", NOMBRE_AUDIO[e->audio]);
+        pantalla_texto(16, 10, estado, 2, COLOR_TINTA, COLOR_FONDO);
+        estado_previo = e->audio;
+    }
+
+    size_t muestras = e->audio == AUDIO_LISTO ? 0 : e->muestras_actuales;
+    if (muestras > GRABACION_MUESTRAS) muestras = GRABACION_MUESTRAS;
+    const unsigned decimas = muestras * 10 / FRECUENCIA_HZ;
+    const unsigned restantes = e->audio == AUDIO_LISTO ? 0 :
+        GRABACION_SEGUNDOS * 10 - decimas;
+    char tiempo[40];
+    snprintf(tiempo, sizeof(tiempo), "PASO %2u.%u REST %2u.%u S",
+             decimas / 10, decimas % 10, restantes / 10, restantes % 10);
+    if (strcmp(tiempo, tiempo_previo) != 0) {
+        pantalla_texto(16, 160, tiempo, 2, COLOR_TINTA, COLOR_FONDO);
+        snprintf(tiempo_previo, sizeof(tiempo_previo), "%s", tiempo);
+    }
+    const int progreso = muestras * BARRA_ANCHO / GRABACION_MUESTRAS;
+    if (progreso > progreso_previo) {
+        pantalla_rect(BARRA_X + progreso_previo, PROGRESO_Y,
+                      progreso - progreso_previo, PROGRESO_ALTO, COLOR_VERDE);
+    } else if (progreso < progreso_previo) {
+        pantalla_rect(BARRA_X + progreso, PROGRESO_Y,
+                      progreso_previo - progreso, PROGRESO_ALTO, COLOR_HUECO);
+    }
+    progreso_previo = progreso;
 
     /* La barra: lo que crece se pinta y lo que mengua se borra. Si además ha
      * cambiado de zona (de verde a ámbar, por ejemplo), hay que repintar
@@ -972,15 +1021,15 @@ static void dibujar_nivel(const estado_t *e)
     fmt_q8(db, sizeof(db), e->db_q8);
     snprintf(linea, sizeof(linea), "%6s DB", db);
     if (cambio_de_zona || strcmp(linea, texto_previo) != 0) {
-        pantalla_texto(16, 48, linea, 4, color, COLOR_FONDO);
+        pantalla_texto(16, 42, linea, 4, color, COLOR_FONDO);
         snprintf(texto_previo, sizeof(texto_previo), "%s", linea);
     }
 
     /* El pie, igual: ancho fijo, y solo cuando cambia. 25 caracteres de 12
      * píxeles son todo lo que cabe en la línea. */
     char pie[40];
-    snprintf(pie, sizeof(pie), "%-5s  GAIN %2" PRId32 "  CLIP %-4" PRIu32,
-             NOMBRE_MODO[e->modo], e->ganancia_db,
+    snprintf(pie, sizeof(pie), "GAIN %2" PRId32 " VOL %3d CLIP %-4" PRIu32,
+             e->ganancia_db, e->volumen,
              (e->recortes > 9999) ? 9999 : e->recortes);
     if (strcmp(pie, pie_previo) != 0) {
         pantalla_texto(16, 208, pie, 2, COLOR_TENUE, COLOR_FONDO);
@@ -1030,24 +1079,21 @@ static void tarea_interfaz(void *arg)
         /* Copia bajo mutex, trabajo lento fuera. Retener el mutex mientras se
          * habla con el SPI de la pantalla bloquearía a la tarea de audio. */
         xSemaphoreTake(s_mutex_estado, portMAX_DELAY);
-        const estado_t e = s_estado;
+        estado_t e = s_estado;
         xSemaphoreGive(s_mutex_estado);
 
-        if (e.bloques == 0) {
-            continue;
+        if (e.audio == AUDIO_REPRODUCIENDO) {
+            portENTER_CRITICAL(&s_mux_tx);
+            e.muestras_actuales = s_tx_muestras_enviadas;
+            portEXIT_CRITICAL(&s_mux_tx);
         }
 
-        /* El LED como semáforo de nivel: verde bien, ámbar cerca del tope,
-         * rojo recortando. Es la misma información que la barra, para quien
-         * mira la placa y no la pantalla. */
-        if (e.db_q8 >= -3 * 256) {
+        if (e.audio == AUDIO_GRABANDO) {
             led(40, 0, 0);
-        } else if (e.db_q8 >= -12 * 256) {
-            led(30, 18, 0);
-        } else if (e.db_q8 >= -45 * 256) {
+        } else if (e.audio == AUDIO_REPRODUCIENDO) {
             led(0, 26, 0);
         } else {
-            led(0, 0, 10);
+            led(0, 0, 0);
         }
 
         if (pantalla_disponible()) {
@@ -1066,9 +1112,10 @@ static void tarea_interfaz(void *arg)
         fmt_q8(db, sizeof(db), e.db_q8);
         fmt_q8(pico, sizeof(pico), e.pico_db_q8);
         barra_de_texto(barra, sizeof(barra), e.db_q8);
-        ESP_LOGI(TAG, "[interfaz] %-6s dBFS %s pico %-6s | modo %-5s gan %" PRId32
-                      " dB  recortes %" PRIu32,
-                 db, barra, pico, NOMBRE_MODO[e.modo], e.ganancia_db, e.recortes);
+        ESP_LOGI(TAG, "[interfaz] %s %-6s dBFS %s pico %-6s | gan %" PRId32
+                      " dB vol %d recortes %" PRIu32,
+                 NOMBRE_AUDIO[e.audio], db, barra, pico, e.ganancia_db,
+                 e.volumen, e.recortes);
     }
 }
 
@@ -1086,8 +1133,22 @@ static void tarea_control_audio(void *arg)
         case AUDIO_EVT_SOLICITAR_GRABACION:
             if (s_estado.audio == AUDIO_LISTO) {
                 s_muestras_grabadas = 0;
+                s_estado.muestras_actuales = 0;
+                s_estado.recortes = 0;
+                s_estado.pico_db_q8 = DB_SUELO_Q8;
                 s_estado.audio = AUDIO_GRABANDO;
                 mensaje = "comienza grabacion";
+            }
+            break;
+
+        case AUDIO_EVT_SOLICITAR_REPRODUCCION:
+            if (s_estado.audio == AUDIO_LISTO &&
+                s_muestras_grabadas == GRABACION_MUESTRAS) {
+                s_estado.audio = AUDIO_REPRODUCIENDO;
+                iniciar_reproduccion = true;
+                mensaje = "PLAY: comienza reproduccion";
+            } else if (s_estado.audio == AUDIO_LISTO) {
+                mensaje = "PLAY: primero hay que grabar";
             }
             break;
 
@@ -1108,6 +1169,12 @@ static void tarea_control_audio(void *arg)
             break;
         }
 
+        if (iniciar_reproduccion) {
+            s_estado.db_q8 = DB_SUELO_Q8;
+            s_estado.pico_db_q8 = DB_SUELO_Q8;
+            s_estado.muestras_actuales = 0;
+            xQueueReset(s_cola_nivel_tx);
+        }
         xSemaphoreGive(s_mutex_estado);
 
         if (mensaje != NULL) {
@@ -1116,6 +1183,7 @@ static void tarea_control_audio(void *arg)
         if (iniciar_reproduccion) {
             xTaskNotifyGive(s_tarea_reproduccion);
         }
+        xTaskNotifyGive(s_tarea_interfaz);
     }
 }
 
@@ -1141,6 +1209,9 @@ static void tarea_reproduccion(void *arg)
         portENTER_CRITICAL(&s_mux_tx);
         s_tx_abortado = false;
         s_tx_ultimo_dma = NULL;
+        s_tx_posicion = 0;
+        s_tx_muestras_enviadas = 0;
+        memset(s_tx_con_audio, 0, sizeof(s_tx_con_audio));
         portEXIT_CRITICAL(&s_mux_tx);
 
         size_t offset = 0;
@@ -1174,11 +1245,28 @@ static void tarea_reproduccion(void *arg)
             /* El último bloque lleva silencio después de la última muestra:
              * así todos los descriptores conservan el mismo tamaño. */
             memset(bloque->muestras, 0, sizeof(bloque->muestras));
+            int32_t suma = 0;
             for (size_t i = 0; i < tramas; i++) {
                 int16_t muestra = s_buffer_grabacion[offset + i];
                 bloque->muestras[2 * i]     = muestra;
                 bloque->muestras[2 * i + 1] = muestra;
+                suma += muestra;
             }
+            /* La medida viaja con el bloque y se muestra cuando sale por TX. */
+            const int32_t continua = suma / (int32_t)tramas;
+            uint64_t suma2 = 0;
+            uint32_t pico = 0;
+            for (size_t i = 0; i < tramas; i++) {
+                const int32_t muestra = bloque->muestras[2 * i] - continua;
+                suma2 += (int64_t)muestra * muestra;
+                const uint32_t absoluto = muestra < 0 ? -muestra : muestra;
+                if (absoluto > pico) pico = absoluto;
+            }
+            bloque->nivel = (nivel_t) {
+                .rms = raiz(suma2 / tramas),
+                .pico = pico,
+                .muestras = (uint16_t)tramas,
+            };
             offset += tramas;
             bloque->ultimo = (offset == GRABACION_MUESTRAS);
             ESP_ERROR_CHECK(xQueueSend(s_tx_listos, &bloque, 0) == pdTRUE
@@ -1349,7 +1437,7 @@ static void configurar_tactil(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== audio_vu: microfono, codec ES8311 y VU-metro ===");
-    ESP_LOGI(TAG, "PLAY = balistica VU/PPM/CRUDO | VOL_UP y VOL_DOWN = ganancia | "
+    ESP_LOGI(TAG, "PLAY = repetir grabacion | VOL_UP y VOL_DOWN = ganancia/volumen | "
               "RECORD = grabar 10 s y reproducir");
 
     COLOR_FONDO = pantalla_color(10, 16, 30);
@@ -1361,7 +1449,7 @@ void app_main(void)
     COLOR_ROJO  = pantalla_color(226, 70, 60);
 
     configurar_led();
-    led(30, 16, 0);                       /* ámbar: arrancando */
+    led(0, 0, 0);
 
     if (pantalla_iniciar()) {
         ESP_LOGI(TAG, "pantalla %s activa", pantalla_controlador());
@@ -1379,9 +1467,11 @@ void app_main(void)
     s_cola_control_audio = xQueueCreate(4, sizeof(evento_audio_t));
     s_tx_libres = xQueueCreate(TX_BLOQUES_PREPARADOS, sizeof(bloque_tx_t *));
     s_tx_listos = xQueueCreate(TX_BLOQUES_PREPARADOS, sizeof(bloque_tx_t *));
+    /* Solo interesa el último nivel de salida para refrescar el VU. */
+    s_cola_nivel_tx = xQueueCreate(1, sizeof(nivel_t));
     
     ESP_ERROR_CHECK((s_cola_niveles && s_cola_toques && s_cola_control_audio &&
-                    s_mutex_estado && s_tx_libres && s_tx_listos)
+                    s_mutex_estado && s_tx_libres && s_tx_listos && s_cola_nivel_tx)
                         ? ESP_OK : ESP_ERR_NO_MEM);
 
     s_buffer_grabacion = heap_caps_malloc(
